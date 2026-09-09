@@ -1,0 +1,6 @@
+# Logs / temp
+*.log
+*.tmp
+
+# Test artifacts
+_test/
