@@ -53,6 +53,7 @@ $script:IconKeep    = $null
 $script:OcrEngine   = $null
 $script:Config      = $null
 $script:UiFont      = $null
+$script:UiScale     = 0
 $script:Dlg         = $null
 $script:DlgForm     = $null
 $script:DlgTesting  = $false
@@ -871,6 +872,41 @@ function Get-UiFont {
     return $script:UiFont
 }
 
+# 界面缩放系数 = 显示器 DPI / 96。
+# 字体是按“点”算的，会自动跟着 DPI 放大，但控件的像素坐标不会 —— 所以在 200% 缩放的
+# 屏幕上，写死 96 DPI 坐标的窗口会把每一行文字都截断。这里把所有坐标/尺寸统一乘上系数。
+function Get-UiScale {
+    if ($script:UiScale -gt 0) { return $script:UiScale }
+    $dpi = 96.0
+    try {
+        $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        try { $dpi = [double]$g.DpiX } finally { $g.Dispose() }
+    } catch { }
+    if ($dpi -le 0) { $dpi = 96.0 }
+    $s = $dpi / 96.0
+    # 兜底：屏幕太矮时不让窗口高过屏幕（否则底部按钮点不到）
+    try {
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $maxS = ($wa.Height - 40) / 640.0
+        if ($maxS -lt 1.0) { $maxS = 1.0 }
+        if ($s -gt $maxS) { $s = $maxS }
+    } catch { }
+    $script:UiScale = $s
+    return $s
+}
+
+function New-ScaledPoint {
+    param([double]$X, [double]$Y)
+    $s = Get-UiScale
+    return (New-Object System.Drawing.Point([int][Math]::Round($X * $s), [int][Math]::Round($Y * $s)))
+}
+
+function New-ScaledSize {
+    param([double]$W, [double]$H)
+    $s = Get-UiScale
+    return (New-Object System.Drawing.Size([int][Math]::Round($W * $s), [int][Math]::Round($H * $s)))
+}
+
 function New-TrayIcon {
     $bmp = New-Object System.Drawing.Bitmap(32, 32, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -1009,8 +1045,8 @@ function New-Label {
     param([string]$Text, [int]$X, [int]$Y, [int]$W = 0, [switch]$Bold)
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $Text
-    $l.Location = New-Object System.Drawing.Point($X, $Y)
-    if ($W -gt 0) { $l.Size = New-Object System.Drawing.Size($W, 20) } else { $l.AutoSize = $true }
+    $l.Location = (New-ScaledPoint $X $Y)
+    if ($W -gt 0) { $l.Size = (New-ScaledSize $W 20) } else { $l.AutoSize = $true }
     if ($Bold) { $l.Font = New-Object System.Drawing.Font((Get-UiFont).FontFamily, 9.5, [System.Drawing.FontStyle]::Bold) }
     return $l
 }
@@ -1060,13 +1096,14 @@ function Show-SettingsWindow {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '屏幕OCR助手 · 设置'
-    $form.ClientSize = New-Object System.Drawing.Size(624, 600)
+    $form.ClientSize = (New-ScaledSize 624 640)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
     $form.ShowInTaskbar = $true
     $form.Font = $font
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $form.TopMost = $true
     $d['Form'] = $form
 
@@ -1074,18 +1111,18 @@ function Show-SettingsWindow {
 
     $rbLocal = New-Object System.Windows.Forms.RadioButton
     $rbLocal.Text = '本地识别（Windows 内置 OCR）— 离线、免费、不上传【默认】'
-    $rbLocal.Location = New-Object System.Drawing.Point(20, 38)
+    $rbLocal.Location = (New-ScaledPoint 20 38)
     $rbLocal.AutoSize = $true
     $d['rbLocal'] = $rbLocal
 
     $rbApi = New-Object System.Windows.Forms.RadioButton
     $rbApi.Text = 'DeepSeek 接口识别 — 上传截图，复杂排版 / 小字更准（需 API Key）'
-    $rbApi.Location = New-Object System.Drawing.Point(20, 62)
+    $rbApi.Location = (New-ScaledPoint 20 62)
     $rbApi.AutoSize = $true
     $d['rbApi'] = $rbApi
 
     $lblEngineHint = New-Object System.Windows.Forms.Label
-    $lblEngineHint.Location = New-Object System.Drawing.Point(40, 86)
+    $lblEngineHint.Location = (New-ScaledPoint 40 86)
     $lblEngineHint.AutoSize = $true
     $lblEngineHint.ForeColor = [System.Drawing.Color]::DimGray
     $d['lblEngineHint'] = $lblEngineHint
@@ -1097,22 +1134,22 @@ function Show-SettingsWindow {
     # ---- DeepSeek 接口 ----
     $gbApi = New-Object System.Windows.Forms.GroupBox
     $gbApi.Text = 'DeepSeek 接口设置'
-    $gbApi.Location = New-Object System.Drawing.Point(12, 110)
-    $gbApi.Size = New-Object System.Drawing.Size(600, 214)
+    $gbApi.Location = (New-ScaledPoint 12 110)
+    $gbApi.Size = (New-ScaledSize 600 246)
     [void]$form.Controls.Add($gbApi)
 
     [void]$gbApi.Controls.Add((New-Label '接口地址' 14 30))
     $txtBase = New-Object System.Windows.Forms.TextBox
-    $txtBase.Location = New-Object System.Drawing.Point(130, 27)
-    $txtBase.Size = New-Object System.Drawing.Size(450, 23)
+    $txtBase.Location = (New-ScaledPoint 130 27)
+    $txtBase.Size = (New-ScaledSize 450 23)
     $txtBase.Text = [string]$ds['baseUrl']
     $d['txtBase'] = $txtBase
     [void]$gbApi.Controls.Add($txtBase)
 
     [void]$gbApi.Controls.Add((New-Label '模型' 14 60))
     $txtModel = New-Object System.Windows.Forms.TextBox
-    $txtModel.Location = New-Object System.Drawing.Point(130, 57)
-    $txtModel.Size = New-Object System.Drawing.Size(190, 23)
+    $txtModel.Location = (New-ScaledPoint 130 57)
+    $txtModel.Size = (New-ScaledSize 190 23)
     $txtModel.Text = [string]$ds['model']
     $d['txtModel'] = $txtModel
     [void]$gbApi.Controls.Add($txtModel)
@@ -1120,8 +1157,8 @@ function Show-SettingsWindow {
     [void]$gbApi.Controls.Add((New-Label '图片细节' 336 60))
     $cboDetail = New-Object System.Windows.Forms.ComboBox
     $cboDetail.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-    $cboDetail.Location = New-Object System.Drawing.Point(405, 57)
-    $cboDetail.Size = New-Object System.Drawing.Size(175, 23)
+    $cboDetail.Location = (New-ScaledPoint 405 57)
+    $cboDetail.Size = (New-ScaledSize 175 23)
     [void]$cboDetail.Items.AddRange(@('original', 'high', 'low', 'auto'))
     $cboDetail.SelectedItem = [string]$ds['detail']
     if ($null -eq $cboDetail.SelectedItem) { $cboDetail.SelectedIndex = 0 }
@@ -1130,8 +1167,8 @@ function Show-SettingsWindow {
 
     [void]$gbApi.Controls.Add((New-Label 'API Key' 14 90))
     $txtKey = New-Object System.Windows.Forms.TextBox
-    $txtKey.Location = New-Object System.Drawing.Point(130, 87)
-    $txtKey.Size = New-Object System.Drawing.Size(310, 23)
+    $txtKey.Location = (New-ScaledPoint 130 87)
+    $txtKey.Size = (New-ScaledSize 310 23)
     $txtKey.Text = [string]$ds['apiKey']
     $txtKey.UseSystemPasswordChar = $true
     $d['txtKey'] = $txtKey
@@ -1139,15 +1176,15 @@ function Show-SettingsWindow {
 
     $chkShow = New-Object System.Windows.Forms.CheckBox
     $chkShow.Text = '显示'
-    $chkShow.Location = New-Object System.Drawing.Point(452, 89)
+    $chkShow.Location = (New-ScaledPoint 452 89)
     $chkShow.AutoSize = $true
     $d['chkShow'] = $chkShow
     [void]$gbApi.Controls.Add($chkShow)
 
     [void]$gbApi.Controls.Add((New-Label '图片最长边' 14 120))
     $numMaxSide = New-Object System.Windows.Forms.NumericUpDown
-    $numMaxSide.Location = New-Object System.Drawing.Point(130, 117)
-    $numMaxSide.Size = New-Object System.Drawing.Size(80, 23)
+    $numMaxSide.Location = (New-ScaledPoint 130 117)
+    $numMaxSide.Size = (New-ScaledSize 80 23)
     $numMaxSide.Minimum = 0
     $numMaxSide.Maximum = 8192
     $numMaxSide.Value = [decimal][Math]::Max(0, [Math]::Min(8192, [int]$ds['maxSide']))
@@ -1157,8 +1194,8 @@ function Show-SettingsWindow {
 
     [void]$gbApi.Controls.Add((New-Label '超时' 14 150))
     $numTimeout = New-Object System.Windows.Forms.NumericUpDown
-    $numTimeout.Location = New-Object System.Drawing.Point(130, 147)
-    $numTimeout.Size = New-Object System.Drawing.Size(80, 23)
+    $numTimeout.Location = (New-ScaledPoint 130 147)
+    $numTimeout.Size = (New-ScaledSize 80 23)
     $numTimeout.Minimum = 5
     $numTimeout.Maximum = 300
     $numTimeout.Value = [decimal][Math]::Max(5, [Math]::Min(300, [int]$ds['timeoutSec']))
@@ -1168,23 +1205,23 @@ function Show-SettingsWindow {
 
     $lnkKey = New-Object System.Windows.Forms.LinkLabel
     $lnkKey.Text = '→ 还没有 Key？点这里打开 DeepSeek 开放平台申请'
-    $lnkKey.Location = New-Object System.Drawing.Point(130, 180)
+    $lnkKey.Location = (New-ScaledPoint 130 180)
     $lnkKey.AutoSize = $true
     $d['lnkKey'] = $lnkKey
     [void]$gbApi.Controls.Add($lnkKey)
 
-    [void]$gbApi.Controls.Add((New-Label 'Key 只保存在本机配置文件里，不会发给除上面接口地址以外的任何地方。' 14 180))
+    [void]$gbApi.Controls.Add((New-Label 'Key 只保存在本机配置文件里，不会发给除上面接口地址以外的任何地方。' 14 208))
 
     # ---- 提示词 ----
     $gbPrompt = New-Object System.Windows.Forms.GroupBox
     $gbPrompt.Text = '上下文提示词（写给模型的要求；仅接口引擎生效，可自行修改）'
-    $gbPrompt.Location = New-Object System.Drawing.Point(12, 332)
-    $gbPrompt.Size = New-Object System.Drawing.Size(600, 186)
+    $gbPrompt.Location = (New-ScaledPoint 12 364)
+    $gbPrompt.Size = (New-ScaledSize 600 186)
     [void]$form.Controls.Add($gbPrompt)
 
     $txtPrompt = New-Object System.Windows.Forms.TextBox
-    $txtPrompt.Location = New-Object System.Drawing.Point(14, 22)
-    $txtPrompt.Size = New-Object System.Drawing.Size(572, 116)
+    $txtPrompt.Location = (New-ScaledPoint 14 22)
+    $txtPrompt.Size = (New-ScaledSize 572 116)
     $txtPrompt.Multiline = $true
     $txtPrompt.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
     $txtPrompt.AcceptsReturn = $true
@@ -1195,8 +1232,8 @@ function Show-SettingsWindow {
 
     $btnResetPrompt = New-Object System.Windows.Forms.Button
     $btnResetPrompt.Text = '恢复默认提示词'
-    $btnResetPrompt.Location = New-Object System.Drawing.Point(14, 146)
-    $btnResetPrompt.Size = New-Object System.Drawing.Size(120, 28)
+    $btnResetPrompt.Location = (New-ScaledPoint 14 146)
+    $btnResetPrompt.Size = (New-ScaledSize 120 28)
     $d['btnResetPrompt'] = $btnResetPrompt
     [void]$gbPrompt.Controls.Add($btnResetPrompt)
     [void]$gbPrompt.Controls.Add((New-Label '默认要求：只输出文字、不用 Markdown、保留换行、不翻译不改写。' 146 152))
@@ -1204,8 +1241,8 @@ function Show-SettingsWindow {
     # ---- 底部 ----
     # 状态栏独占一整行，否则识别结果会被挤在按钮旁边截断
     $lblStatus = New-Object System.Windows.Forms.Label
-    $lblStatus.Location = New-Object System.Drawing.Point(16, 524)
-    $lblStatus.Size = New-Object System.Drawing.Size(596, 20)
+    $lblStatus.Location = (New-ScaledPoint 16 556)
+    $lblStatus.Size = (New-ScaledSize 596 20)
     $lblStatus.AutoEllipsis = $true
     $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
     $d['lblStatus'] = $lblStatus
@@ -1213,22 +1250,22 @@ function Show-SettingsWindow {
 
     $btnTest = New-Object System.Windows.Forms.Button
     $btnTest.Text = '测试接口'
-    $btnTest.Location = New-Object System.Drawing.Point(302, 552)
-    $btnTest.Size = New-Object System.Drawing.Size(100, 32)
+    $btnTest.Location = (New-ScaledPoint 302 584)
+    $btnTest.Size = (New-ScaledSize 100 32)
     $d['btnTest'] = $btnTest
     [void]$form.Controls.Add($btnTest)
 
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Text = '保存并关闭'
-    $btnSave.Location = New-Object System.Drawing.Point(408, 552)
-    $btnSave.Size = New-Object System.Drawing.Size(110, 32)
+    $btnSave.Location = (New-ScaledPoint 408 584)
+    $btnSave.Size = (New-ScaledSize 110 32)
     $d['btnSave'] = $btnSave
     [void]$form.Controls.Add($btnSave)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = '取消'
-    $btnCancel.Location = New-Object System.Drawing.Point(524, 552)
-    $btnCancel.Size = New-Object System.Drawing.Size(88, 32)
+    $btnCancel.Location = (New-ScaledPoint 524 584)
+    $btnCancel.Size = (New-ScaledSize 88 32)
     $d['btnCancel'] = $btnCancel
     [void]$form.Controls.Add($btnCancel)
 
