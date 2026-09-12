@@ -30,6 +30,7 @@ param(
     [switch]$ShowConfig,
     [switch]$ApiSelfTest,
     [switch]$ClipboardTest,
+    [switch]$ExitTest,
     [switch]$ChordTest,
     [switch]$ChordTestLive
 )
@@ -62,6 +63,10 @@ $script:DlgProviderIds  = @()
 $script:LastOcrText = $null
 $script:ClipPending = $null
 $script:ClipTimer   = $null
+$script:ExitTimer   = $null
+$script:MenuEngine  = $null
+$script:MenuRecopy  = $null
+$script:MenuExitItem = $null
 $script:Dlg         = $null
 $script:DlgForm     = $null
 $script:DlgTesting  = $false
@@ -591,6 +596,27 @@ namespace ImgOcrNative
         public static int VkAlt { get { return VK_MENU; } }
         public static int VkR { get { return VK_R; } }
         public static int VkS { get { return VK_S; } }
+    }
+
+    /// <summary>注入真实鼠标点击，供 -ExitTest 之类的自检走「用户真实操作」路径。</summary>
+    public static class Mouse
+    {
+        private const uint LEFTDOWN = 0x0002;
+        private const uint LEFTUP = 0x0004;
+
+        [DllImport("user32.dll")]
+        private static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")]
+        private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+        public static void ClickAt(int x, int y)
+        {
+            SetCursorPos(x, y);
+            System.Threading.Thread.Sleep(80);
+            mouse_event(LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+            System.Threading.Thread.Sleep(80);
+            mouse_event(LEFTUP, 0, 0, 0, UIntPtr.Zero);
+        }
     }
 
     /// <summary>
@@ -1992,7 +2018,24 @@ function Set-AutoStart {
 # =====================================================================
 #  程序生命周期
 # =====================================================================
+# 请求退出：只负责让消息循环停下来，**不销毁任何东西**。
+# 托盘菜单项自己的点击处理里不能顺手 Dispose 掉那个菜单：ToolStrip 收尾时
+# 会碰到已释放的对象，抛出的异常在消息循环里没人接，就变成 .NET 报错框。
+# 真正的销毁交给 Application.Run() 返回之后的 Invoke-Exit。
+function Request-Exit {
+    try { if ($null -ne $script:ExitTimer) { $script:ExitTimer.Stop() } } catch { }
+    $script:ExitTimer = New-Object System.Windows.Forms.Timer
+    $script:ExitTimer.Interval = 60
+    $script:ExitTimer.add_Tick({
+        try { $script:ExitTimer.Stop() } catch { }
+        try { [System.Windows.Forms.Application]::Exit() } catch { }
+    })
+    $script:ExitTimer.Start()
+}
+
+# 真正的清理，只在消息循环结束后调用
 function Invoke-Exit {
+    try { if ($null -ne $script:ExitTimer) { $script:ExitTimer.Stop() } } catch { }
     try { if ($null -ne $script:ApiTimer) { $script:ApiTimer.Stop() } } catch { }
     try { if ($null -ne $script:ClipTimer) { $script:ClipTimer.Stop() } } catch { }
     try { if ($null -ne $script:CfgWatch) { $script:CfgWatch.Stop() } } catch { }
@@ -2001,6 +2044,22 @@ function Invoke-Exit {
     try { if ($script:Notify) { $script:Notify.Visible = $false; $script:Notify.Dispose() } } catch { }
     try { if ($script:HotkeyWin) { $script:HotkeyWin.UnregisterHotkey($script:HK_ID_REGION); $script:HotkeyWin.Shutdown() } } catch { }
     try { [System.Windows.Forms.Application]::Exit() } catch { }
+}
+
+# 界面线程兜底：任何漏网的异常都只写日志，绝不弹 .NET 报错框
+# （这是个后台托盘程序，弹框比出错本身更讨厌）
+function Install-ExceptionGuard {
+    try {
+        [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+        [System.Windows.Forms.Application]::add_ThreadException([System.Threading.ThreadExceptionEventHandler]{
+            param($sender, $e)
+            Write-DiagLog ('界面线程未处理异常：' + $e.Exception.ToString())
+        })
+        [System.AppDomain]::CurrentDomain.add_UnhandledException([System.UnhandledExceptionEventHandler]{
+            param($sender, $e)
+            Write-DiagLog ('未处理异常：' + $e.ExceptionObject.ToString())
+        })
+    } catch { }
 }
 
 function Build-TrayUi {
@@ -2056,17 +2115,28 @@ function Build-TrayUi {
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $miExit = New-Object System.Windows.Forms.ToolStripMenuItem('退出')
-    $miExit.add_Click({ Invoke-Exit })
+    $miExit.add_Click({ Request-Exit })
     [void]$menu.Items.Add($miExit)
 
+    # 注意：下面这些引用必须放 $script: 作用域。Build-TrayUi 早就返回了，
+    # 事件处理器运行时函数局部变量已经不存在（取到 $null），而 Opening 里的异常
+    # 发生在消息循环内，try/catch 抓不到，默认就会弹一个 .NET 报错框。
+    $script:MenuEngine = $miMode
+    $script:MenuRecopy = $miRecopy
+    $script:MenuExitItem = $miExit
     $menu.add_Opening({
-        $active = [string](Resolve-Engine)['Active']
-        $miMode.Text = '识别引擎：' + (Get-EngineLabel)
-        $miModeLocal.Checked = ($active -eq 'local')
-        foreach ($mi in $miMode.DropDownItems) {
-            if ($null -ne $mi.Tag) { $mi.Checked = ([string]$mi.Tag -eq $active) }
+        try {
+            $active = [string](Resolve-Engine)['Active']
+            $script:MenuEngine.Text = '识别引擎：' + (Get-EngineLabel)
+            # 子菜单里每一项都带 Tag（含「本地 OCR」），统一在这里打勾
+            foreach ($mi in $script:MenuEngine.DropDownItems) {
+                if ($null -ne $mi.Tag) { $mi.Checked = ([string]$mi.Tag -eq $active) }
+            }
+            $script:MenuRecopy.Enabled = (-not [string]::IsNullOrEmpty($script:LastOcrText))
+        } catch {
+            # 菜单刷新只是锦上添花，出问题也不能影响弹菜单
+            Write-DiagLog ('托盘菜单刷新失败：' + $_.Exception.Message)
         }
-        $miRecopy.Enabled = (-not [string]::IsNullOrEmpty($script:LastOcrText))
     })
     $script:Notify.ContextMenuStrip = $menu
 }
@@ -2132,6 +2202,7 @@ function Start-Assistant {
 
     [void][ImgOcrNative.Dpi]::MakeAware()
     try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
+    Install-ExceptionGuard
 
     $engine = Resolve-Engine
     if ($engine['Active'] -eq 'local') {
@@ -2164,13 +2235,13 @@ function Start-Assistant {
     if ($GuiSmoke) {
         $smokeTimer = New-Object System.Windows.Forms.Timer
         $smokeTimer.Interval = 2500
-        $smokeTimer.add_Tick({ $smokeTimer.Stop(); Invoke-Exit })
+        $smokeTimer.add_Tick({ $smokeTimer.Stop(); Request-Exit })
         $smokeTimer.Start()
     }
 
     try { [System.Windows.Forms.Application]::Run() }
     catch { Write-Output ('GUISMOKE-CRASH ' + $_.Exception.ToString()) }
-    Invoke-Exit
+    Invoke-Exit   # 真正的清理都在消息循环之后做
     if ($GuiSmoke) { Write-Output 'GUISMOKE-OK' }
 }
 
@@ -2263,6 +2334,116 @@ function Invoke-ClipboardTest {
         Write-Output 'CLIPTEST note=裸探针失败说明有程序在抢剪贴板（微信/剪贴板工具最常见）；工具本身会重试，所以不影响使用。'
     }
     Write-Output 'CLIPTEST-DONE'
+}
+
+# 退出路径自检：真的把托盘菜单弹出来、用键盘选中「退出」再回车。
+# 目的是抓「消息循环里的未处理异常」—— 这种异常 try/catch 抓不到，
+# 默认行为就是弹一个 .NET 报错对话框（用户看到的就是这个）。
+function Invoke-ExitTest {
+    Write-Output 'EXITTEST-START'
+    $script:ExitTestLog = New-Object System.Collections.ArrayList
+    $script:ExitTestFail = 0
+
+    # 先装兜底，并把异常记下来（正式运行时这里是写日志、不弹框）
+    try {
+        [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+        [System.Windows.Forms.Application]::add_ThreadException([System.Threading.ThreadExceptionEventHandler]{
+            param($sender, $e)
+            $script:ExitTestFail++
+            [void]$script:ExitTestLog.Add('未处理异常 ' + $e.Exception.GetType().FullName + ' :: ' + $e.Exception.Message)
+            if ($null -ne $e.Exception.StackTrace) { [void]$script:ExitTestLog.Add(($e.Exception.StackTrace -split "`n")[0]) }
+        })
+    } catch { [void]$script:ExitTestLog.Add('装兜底失败: ' + $_.Exception.Message) }
+
+    [void][ImgOcrNative.Dpi]::MakeAware()
+    try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
+    $script:Config = Import-Config
+    $script:Busy = $false
+    $script:Chord = New-Object ImgOcrNative.KeyChord
+    $script:Chord.add_OcrRequested({ })
+    $script:Chord.add_SettingsRequested({ })
+    [void]$script:Chord.Install()
+    Build-TrayUi
+
+    $t1 = New-Object System.Windows.Forms.Timer
+    $t1.Interval = 1800
+    $t1.add_Tick({
+        $t1.Stop()
+        try {
+            # 先把鼠标挪到屏幕中间再弹菜单：贴边时菜单会自己翻转位置，
+            # 算出来的点击坐标就偏了（这个是自检本身的坑，不是程序的）
+            [System.Windows.Forms.Cursor]::Position = (New-Object System.Drawing.Point(700, 500))
+            Start-Sleep -Milliseconds 200
+            $script:Notify.ContextMenuStrip.Show([System.Windows.Forms.Cursor]::Position)
+            [void]$script:ExitTestLog.Add('托盘菜单已弹出')
+        } catch {
+            $ex = $_.Exception
+            $msg = '弹菜单失败: ' + $ex.GetType().FullName + ' :: ' + $ex.Message
+            if ($null -ne $ex.InnerException) { $msg = $msg + ' | inner: ' + $ex.InnerException.GetType().FullName + ' :: ' + $ex.InnerException.Message }
+            [void]$script:ExitTestLog.Add($msg)
+            if ($_.ScriptStackTrace) { [void]$script:ExitTestLog.Add('stack: ' + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) }
+        }
+    })
+    $t1.Start()
+
+    $t2 = New-Object System.Windows.Forms.Timer
+    $t2.Interval = 3000
+    $t2.add_Tick({
+        $t2.Stop()
+        try {
+            # 先确认 Opening 处理器真的跑成功了（这正是当初会抛未处理异常的地方）
+            if ($null -eq $script:MenuEngine -or [string]::IsNullOrWhiteSpace([string]$script:MenuEngine.Text)) {
+                $script:ExitTestFail++
+                [void]$script:ExitTestLog.Add('菜单标题没被刷新，Opening 处理器可能又挂了')
+            } else {
+                [void]$script:ExitTestLog.Add('菜单标题=' + [string]$script:MenuEngine.Text + '，复制上次结果 enabled=' + [string]$script:MenuRecopy.Enabled)
+            }
+            $mi = $script:MenuExitItem
+            $menu = $script:Notify.ContextMenuStrip
+            # 先试注入真实点击（最贴近用户操作）；注入偶尔不生效就退化为直接触发菜单项，
+            # 两者走的是同一个 Click 处理器，退出逻辑一样会被执行到。
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+                if ($null -ne $script:ExitTimer) { break }
+                if ($null -ne $mi -and $null -ne $menu -and $menu.Visible) {
+                    $pt = $menu.RectangleToScreen($mi.Bounds)
+                    $cx = $pt.X + [int]($pt.Width / 2)
+                    $cy = $pt.Y + [int]($pt.Height / 2)
+                    [void]$script:ExitTestLog.Add('第 ' + $attempt + ' 次：在 (' + $cx + ',' + $cy + ') 注入真实点击「退出」')
+                    [ImgOcrNative.Mouse]::ClickAt($cx, $cy)
+                }
+                Start-Sleep -Milliseconds 700
+            }
+            if ($null -eq $script:ExitTimer) {
+                [void]$script:ExitTestLog.Add('注入点击未生效，改为直接触发菜单项（同一个 Click 处理器）')
+                $mi.PerformClick()
+                Start-Sleep -Milliseconds 500
+            }
+            if ($null -ne $script:ExitTimer) {
+                [void]$script:ExitTestLog.Add('菜单「退出」已触发（Request-Exit 执行完成）')
+            } else {
+                $script:ExitTestFail++
+                [void]$script:ExitTestLog.Add('「退出」没能触发')
+            }
+        } catch { [void]$script:ExitTestLog.Add('点击失败: ' + $_.Exception.Message) }
+    })
+    $t2.Start()
+
+    $t3 = New-Object System.Windows.Forms.Timer
+    $t3.Interval = 12000
+    $t3.add_Tick({
+        $t3.Stop()
+        [void]$script:ExitTestLog.Add('超时兜底：仍在运行，强制退出')
+        $script:ExitTestFail++
+        Request-Exit
+    })
+    $t3.Start()
+
+    try { [System.Windows.Forms.Application]::Run() }
+    catch { [void]$script:ExitTestLog.Add('Run 抛出: ' + $_.Exception.Message) }
+    Invoke-Exit
+    foreach ($l in $script:ExitTestLog) { Write-Output ('EXITTEST ' + $l) }
+    Write-Output ('EXITTEST result fail=' + $script:ExitTestFail)
+    Write-Output 'EXITTEST-DONE'
 }
 
 function Invoke-SmokeTest {
@@ -2516,6 +2697,7 @@ try {
         return
     }
     if ($SmokeTest) { Invoke-SmokeTest; return }
+    if ($ExitTest) { Invoke-ExitTest; return }
     if ($Settings) { Start-SettingsOnly; return }
     Start-Assistant -GuiSmoke:$GuiSmoke
 }
