@@ -56,6 +56,9 @@ $script:OcrEngine   = $null
 $script:Config      = $null
 $script:UiFont      = $null
 $script:UiScale     = 0
+$script:ProviderCache   = $null
+$script:DlgDraft        = $null
+$script:DlgProviderIds  = @()
 $script:LastOcrText = $null
 $script:ClipPending = $null
 $script:ClipTimer   = $null
@@ -68,8 +71,136 @@ $script:CfgWatch    = $null
 $script:CfgStamp    = $null
 
 # =====================================================================
-#  配置：默认值 / 读写
+#  识别引擎目录（扩展点 1/2）
+#  ------------------------------------------------------------------
+#  要接一个新模型/新服务，通常只要在下面的表里加一条：
+#    id = [ordered]@{
+#        kind      = 'remote'            # 'local' 或 'remote'
+#        shape     = 'openai-vision'     # 请求格式，见 $script:RequestShapes（扩展点 2/2）
+#        name      = '显示名'
+#        desc      = '设置窗口里的一句话说明'
+#        baseUrl   = 'https://...'       # 预设，用户可改
+#        model     = '默认模型名'
+#        models    = @('建议模型1','建议模型2')   # 只用于界面提示
+#        keyUrl    = '申请 Key 的网址'    # 可空
+#        keyRequired = $true             # 本地模型服务可以设 $false
+#        supportsDetail = $true          # 是否认 image_url.detail 字段
+#        note      = '注意事项'
+#    }
+#  shape 不用 openai-vision 的（比如 Anthropic / Gemini 原生格式），
+#  在 $script:RequestShapes 里加一个同名脚本块即可，其余代码不用动。
 # =====================================================================
+function Get-ProviderCatalog {
+    if ($null -ne $script:ProviderCache) { return $script:ProviderCache }
+    $script:ProviderCache = [ordered]@{
+        'local' = [ordered]@{
+            id             = 'local'
+            kind           = 'local'
+            name           = '本地识别（Windows 内置 OCR）'
+            desc           = '离线、免费、不上传；开箱默认'
+            keyRequired    = $false
+            supportsDetail = $false
+        }
+        'deepseek' = [ordered]@{
+            id             = 'deepseek'
+            kind           = 'remote'
+            shape          = 'openai-vision'
+            name           = 'DeepSeek'
+            desc           = 'deepseek-flash 支持图片输入'
+            baseUrl        = 'https://api.deepseek.com'
+            model          = 'deepseek-flash'
+            models         = @('deepseek-flash')
+            keyUrl         = 'https://platform.deepseek.com/api_keys'
+            keyRequired    = $true
+            supportsDetail = $true
+            note           = '官方接口，已实测'
+        }
+        'openai' = [ordered]@{
+            id             = 'openai'
+            kind           = 'remote'
+            shape          = 'openai-vision'
+            name           = 'OpenAI'
+            desc           = 'gpt-4o / gpt-4o-mini 等视觉模型'
+            baseUrl        = 'https://api.openai.com/v1'
+            model          = 'gpt-4o-mini'
+            models         = @('gpt-4o-mini', 'gpt-4o')
+            keyUrl         = 'https://platform.openai.com/api-keys'
+            keyRequired    = $true
+            supportsDetail = $true
+            note           = '地址/模型为预设值，未实测'
+        }
+        'dashscope' = [ordered]@{
+            id             = 'dashscope'
+            kind           = 'remote'
+            shape          = 'openai-vision'
+            name           = '阿里云百炼（通义千问 VL）'
+            desc           = 'qwen-vl 系列，OpenAI 兼容模式'
+            baseUrl        = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+            model          = 'qwen-vl-max-latest'
+            models         = @('qwen-vl-max-latest', 'qwen-vl-plus')
+            keyUrl         = 'https://bailian.console.aliyun.com/'
+            keyRequired    = $true
+            supportsDetail = $false
+            note           = '地址/模型为预设值，未实测'
+        }
+        'siliconflow' = [ordered]@{
+            id             = 'siliconflow'
+            kind           = 'remote'
+            shape          = 'openai-vision'
+            name           = '硅基流动 SiliconFlow'
+            desc           = '上面托管了多种开源 VL 模型'
+            baseUrl        = 'https://api.siliconflow.cn/v1'
+            model          = 'Qwen/Qwen2.5-VL-72B-Instruct'
+            models         = @('Qwen/Qwen2.5-VL-72B-Instruct', 'deepseek-ai/deepseek-vl2')
+            keyUrl         = 'https://cloud.siliconflow.cn/account/ak'
+            keyRequired    = $true
+            supportsDetail = $false
+            note           = '地址/模型为预设值，未实测'
+        }
+        'ollama' = [ordered]@{
+            id             = 'ollama'
+            kind           = 'remote'
+            shape          = 'openai-vision'
+            name           = 'Ollama（本机模型）'
+            desc           = '本机跑视觉模型，数据不出内网'
+            baseUrl        = 'http://127.0.0.1:11434/v1'
+            model          = 'qwen2.5vl:7b'
+            models         = @('qwen2.5vl:7b', 'llama3.2-vision')
+            keyUrl         = 'https://ollama.com/search?c=vision'
+            keyRequired    = $false
+            supportsDetail = $false
+            note           = '需要本机已装 Ollama 并 pull 了视觉模型'
+        }
+        'custom' = [ordered]@{
+            id             = 'custom'
+            kind           = 'remote'
+            shape          = 'openai-vision'
+            name           = '自定义（任意 OpenAI 兼容接口）'
+            desc           = '自己填接口地址和模型名'
+            baseUrl        = ''
+            model          = ''
+            models         = @()
+            keyUrl         = ''
+            keyRequired    = $true
+            supportsDetail = $true
+            note           = '填 /v1 结尾的地址即可，程序会自动补 /chat/completions'
+        }
+    }
+    return $script:ProviderCache
+}
+
+function Get-Provider {
+    param([string]$Id)
+    $catalog = Get-ProviderCatalog
+    if ([string]::IsNullOrWhiteSpace($Id) -or -not $catalog.Contains($Id)) { return $catalog['local'] }
+    return $catalog[$Id]
+}
+
+function Test-ProviderId {
+    param([string]$Id)
+    return (Get-ProviderCatalog).Contains($Id)
+}
+
 function Get-DefaultPrompt {
     return @'
 你是 OCR 文字提取工具：从图片中提取全部可见文字。
@@ -84,20 +215,32 @@ function Get-DefaultPrompt {
 '@
 }
 
-function New-DefaultConfig {
+# 每个 provider 自己一份设置，切换 provider 不会互相覆盖
+function New-ProviderSettings {
+    param([string]$Id)
+    $p = Get-Provider -Id $Id
     return [ordered]@{
-        version  = 1
-        engine   = 'local'          # local | deepseek
-        prompt   = (Get-DefaultPrompt)
-        deepseek = [ordered]@{
-            apiKey      = ''
-            baseUrl     = 'https://api.deepseek.com'
-            model       = 'deepseek-flash'
-            detail      = 'original'   # original | high | low | auto
-            maxSide     = 1920         # 上传前把图片最长边压到该像素数，0 = 不压缩
-            temperature = 0
-            timeoutSec  = 60
-        }
+        apiKey  = ''
+        baseUrl = [string]$p['baseUrl']
+        model   = [string]$p['model']
+        detail  = 'original'
+    }
+}
+
+function New-DefaultConfig {
+    $providers = [ordered]@{}
+    foreach ($id in (Get-ProviderCatalog).Keys) {
+        if ($id -eq 'local') { continue }
+        $providers[$id] = (New-ProviderSettings -Id $id)
+    }
+    return [ordered]@{
+        version   = 2
+        engine    = 'local'          # 'local' 或 provider id
+        prompt    = (Get-DefaultPrompt)
+        maxSide     = 1920           # 上传前把图片最长边压到该像素数，0 = 不压缩
+        temperature = 0
+        timeoutSec  = 60
+        providers = $providers
     }
 }
 
@@ -113,23 +256,47 @@ function Import-Config {
     if (Test-Path -LiteralPath $path) {
         try {
             $j = (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | ConvertFrom-Json
+
             if ($j.engine) { $cfg['engine'] = [string]$j.engine }
             if ($j.prompt) { $cfg['prompt'] = [string]$j.prompt }
+
+            # v2：providers 字典
+            if ($null -ne $j.providers) {
+                foreach ($id in @($cfg['providers'].Keys)) {
+                    $src = $j.providers.$id
+                    if ($null -eq $src) { continue }
+                    foreach ($k in @('apiKey', 'baseUrl', 'model', 'detail')) {
+                        $v = $src.$k
+                        if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { $cfg['providers'][$id][$k] = [string]$v }
+                    }
+                }
+            }
+
+            # v1 兼容：老配置是 { engine = 'deepseek', deepseek = { apiKey/baseUrl/model/detail/maxSide/temperature/timeoutSec } }
             if ($null -ne $j.deepseek) {
-                foreach ($k in @('apiKey', 'baseUrl', 'model', 'detail')) {
-                    $v = $j.deepseek.$k
-                    if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { $cfg['deepseek'][$k] = [string]$v }
+                if ([string]$j.engine -eq 'deepseek' -or -not [string]::IsNullOrWhiteSpace([string]$j.deepseek.apiKey)) {
+                    foreach ($k in @('apiKey', 'baseUrl', 'model', 'detail')) {
+                        $v = $j.deepseek.$k
+                        if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { $cfg['providers']['deepseek'][$k] = [string]$v }
+                    }
                 }
                 foreach ($k in @('maxSide', 'temperature', 'timeoutSec')) {
                     $v = $j.deepseek.$k
-                    if ($null -ne $v) { $cfg['deepseek'][$k] = $v }
+                    if ($null -ne $v) { $cfg[$k] = $v }
                 }
+            }
+
+            # v2 顶层同名项优先
+            foreach ($k in @('maxSide', 'temperature', 'timeoutSec')) {
+                $v = $j.$k
+                if ($null -ne $v) { $cfg[$k] = $v }
             }
         }
         catch { Write-Warning ('配置文件读取失败，改用默认配置：' + $_.Exception.Message) }
     }
     if ([string]::IsNullOrWhiteSpace([string]$cfg['prompt'])) { $cfg['prompt'] = Get-DefaultPrompt }
-    if ($cfg['engine'] -ne 'deepseek') { $cfg['engine'] = 'local' }
+    if (-not (Test-ProviderId -Id ([string]$cfg['engine']))) { $cfg['engine'] = 'local' }
+    if ([string]$cfg['engine'] -eq 'local') { $cfg['engine'] = 'local' }
     return $cfg
 }
 
@@ -146,11 +313,32 @@ function Export-Config {
     return $path
 }
 
-# 引擎判定：deepseek 需要 API Key，否则退回本地
+# 当前生效的引擎：返回 provider 目录项 + 是否需要回退
 function Resolve-Engine {
-    if ($script:Config['engine'] -ne 'deepseek') { return 'local' }
-    if ([string]::IsNullOrWhiteSpace([string]$script:Config['deepseek']['apiKey'])) { return 'local-noauth' }
-    return 'deepseek'
+    $id = [string]$script:Config['engine']
+    if (-not (Test-ProviderId -Id $id)) { $id = 'local' }
+    $p = Get-Provider -Id $id
+    $fallback = ''
+    if ($p['kind'] -eq 'remote' -and [bool]$p['keyRequired']) {
+        $key = [string]$script:Config['providers'][$id]['apiKey']
+        if ([string]::IsNullOrWhiteSpace($key)) { $fallback = 'missing-key' }
+    }
+    return [ordered]@{
+        Id       = $id
+        Provider = $p
+        Kind     = [string]$p['kind']
+        Active   = $(if ($fallback) { 'local' } else { $id })
+        Fallback = $fallback
+    }
+}
+
+function Get-EngineLabel {
+    param($Engine = $null)
+    if ($null -eq $Engine) { $Engine = Resolve-Engine }
+    if ([string]$Engine['Kind'] -eq 'local') { return '本地' }
+    $name = [string]$Engine['Provider']['name']
+    if ($Engine['Fallback'] -eq 'missing-key') { return $name + '·未配置Key' }
+    return $name
 }
 
 # =====================================================================
@@ -759,57 +947,81 @@ function Invoke-OcrImage {
 }
 
 # =====================================================================
-#  DeepSeek 多模态接口（OpenAI 兼容 /chat/completions + image_url）
-#  说明：这段脚本块是「自包含」的，既能直接同步调用，也能丢进 Start-Job 后台跑。
+#  远程识别
+#  ------------------------------------------------------------------
+#  请求格式注册表（扩展点 2/2）：每种 shape 是一个「自包含」脚本块。
+#  约束：块内只能使用传入的 $ctx 和 .NET API，**不要调用本文件里的其它函数** ——
+#        它会被序列化后丢进后台 PowerShell 进程执行。
+#  入参 $ctx：baseUrl/model/apiKey/prompt/detail/temperature/userText/imageBase64
+#  返回：@{ Path = 追加到 baseUrl 的路径; Body = 请求体字符串;
+#           Headers = 附加请求头; Parser = 解析响应的脚本块（返回正文文字） }
+#  要接 Anthropic / Gemini 这类非 OpenAI 格式，在这里加一条就行；
+#  在下面目录里加个 provider 指向新 shape，其余代码不用改。
 # =====================================================================
-$script:DsVisionCall = {
-    param(
-        [string]$ImagePath,
-        [string]$ApiKey,
-        [string]$BaseUrl,
-        [string]$Model,
-        [string]$Prompt,
-        [string]$Detail,
-        [double]$Temperature,
-        [int]$TimeoutSec
-    )
-    $res = @{ Ok = $false; Text = ''; Error = ''; ElapsedMs = 0; Model = $Model; Uri = ''; Status = 0 }
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
-    try { [Net.ServicePointManager]::Expect100Continue = $false } catch { }
-    try {
-        if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw 'API Key 为空：请按 Alt+R+S 打开设置填入 API Key。' }
-        if (-not (Test-Path -LiteralPath $ImagePath)) { throw ('找不到待识别图片：' + $ImagePath) }
-
-        $base = $BaseUrl
-        if ([string]::IsNullOrWhiteSpace($base)) { $base = 'https://api.deepseek.com' }
-        $base = $base.Trim().TrimEnd('/')
-        if ($base -match '/chat/completions$') { $uri = $base } else { $uri = $base + '/chat/completions' }
-        $res.Uri = $uri
-
-        $model = $Model
-        if ([string]::IsNullOrWhiteSpace($model)) { $model = 'deepseek-flash' }
-        $detail = $Detail
-        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = 'original' }
-        $sys = $Prompt
-        if ([string]::IsNullOrWhiteSpace($sys)) { $sys = '提取图片中的全部文字，只输出文字本身，不要使用 Markdown，保留原有换行。' }
-        if ($TimeoutSec -le 0) { $TimeoutSec = 60 }
-
-        $b64 = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ImagePath))
+$script:RequestShapes = @{
+    'openai-vision' = {
+        param($ctx)
+        $image = [ordered]@{ url = ('data:image/png;base64,' + [string]$ctx['imageBase64']) }
+        # 有些服务不认 detail 字段，provider 里 supportsDetail=$false 时就不发
+        if (-not [string]::IsNullOrWhiteSpace([string]$ctx['detail'])) { $image['detail'] = [string]$ctx['detail'] }
         $payload = [ordered]@{
-            model       = $model
+            model       = [string]$ctx['model']
             messages    = @(
-                [ordered]@{ role = 'system'; content = $sys },
+                [ordered]@{ role = 'system'; content = [string]$ctx['prompt'] },
                 [ordered]@{ role = 'user'; content = @(
-                        [ordered]@{ type = 'text'; text = '请提取这张图片中的全部文字。' },
-                        [ordered]@{ type = 'image_url'; image_url = [ordered]@{ url = ('data:image/png;base64,' + $b64); detail = $detail } }
+                        [ordered]@{ type = 'text'; text = [string]$ctx['userText'] },
+                        [ordered]@{ type = 'image_url'; image_url = $image }
                     )
                 }
             )
-            temperature = $Temperature
+            temperature = $ctx['temperature']
             stream      = $false
         }
-        $json = $payload | ConvertTo-Json -Depth 12 -Compress
-        $body = [System.Text.Encoding]::UTF8.GetBytes($json)
+        return @{
+            Path    = '/chat/completions'
+            Body    = ($payload | ConvertTo-Json -Depth 12 -Compress)
+            Headers = @{ Authorization = ('Bearer ' + [string]$ctx['apiKey']) }
+            Parser  = {
+                param($json)
+                $c = $json.choices[0].message.content
+                if ($c -is [string]) { return $c }
+                $t = ''
+                if ($null -ne $c) { foreach ($b in $c) { if ($null -ne $b.text) { $t += [string]$b.text } } }
+                return $t
+            }
+        }
+    }
+}
+
+# 后台任务体：自包含，接收「shape 源码 + 已解析好的参数」，不依赖本文件其它函数
+$script:RemoteVisionCall = {
+    param(
+        [string]$ShapeSource,
+        [hashtable]$Ctx,
+        [string]$ImagePath
+    )
+    $res = @{ Ok = $false; Text = ''; Error = ''; ElapsedMs = 0; Model = [string]$Ctx['model']; Uri = ''; Status = 0 }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+    try { [Net.ServicePointManager]::Expect100Continue = $false } catch { }
+    try {
+        if (-not (Test-Path -LiteralPath $ImagePath)) { throw ('找不到待识别图片：' + $ImagePath) }
+        $base = [string]$Ctx['baseUrl']
+        if ([string]::IsNullOrWhiteSpace($base)) { throw '没有填接口地址：请按 Alt+R+S 打开设置填写。' }
+        $base = $base.Trim().TrimEnd('/')
+
+        # 图片在这里才读进内存并 base64，避免把几 MB 字符串塞进后台任务的参数序列化
+        $Ctx['imageBase64'] = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ImagePath))
+
+        $shapeBuilder = [scriptblock]::Create($ShapeSource)
+        $shape = & $shapeBuilder $Ctx
+        $path = [string]$shape['Path']
+        if ([string]::IsNullOrWhiteSpace($path)) { $path = '/chat/completions' }
+        if ($base.EndsWith($path)) { $uri = $base } else { $uri = $base + $path }
+        $res.Uri = $uri
+
+        $body = [System.Text.Encoding]::UTF8.GetBytes([string]$shape['Body'])
+        $timeout = [int]$Ctx['timeoutSec']
+        if ($timeout -le 0) { $timeout = 60 }
 
         # 直接用 HttpWebRequest：PowerShell 5.1 的 Invoke-RestMethod 在响应头没带 charset
         # 时会把 UTF-8 正文按 Latin-1 解码，中文会变乱码；这里自己读字节并强制 UTF-8。
@@ -822,9 +1034,12 @@ $script:DsVisionCall = {
             $req.ContentType = 'application/json; charset=utf-8'
             $req.Accept = 'application/json'
             $req.UserAgent = 'ImgOcrAssistant/2.0'
-            $req.Headers.Add('Authorization', 'Bearer ' + $ApiKey)
-            $req.Timeout = $TimeoutSec * 1000
-            $req.ReadWriteTimeout = $TimeoutSec * 1000
+            foreach ($k in $shape['Headers'].Keys) {
+                $v = [string]$shape['Headers'][$k]
+                if (-not [string]::IsNullOrWhiteSpace($v)) { $req.Headers.Add([string]$k, $v) }
+            }
+            $req.Timeout = $timeout * 1000
+            $req.ReadWriteTimeout = $timeout * 1000
             try { $req.ServicePoint.Expect100Continue = $false } catch { }
             $rs = $req.GetRequestStream()
             try { $rs.Write($body, 0, $body.Length) } finally { $rs.Close() }
@@ -853,17 +1068,11 @@ $script:DsVisionCall = {
 
         if ($status -lt 200 -or $status -ge 300) { throw ('接口返回 HTTP ' + $status + '：' + $respText) }
         if ([string]::IsNullOrWhiteSpace($respText)) { throw ('接口返回空响应（HTTP ' + $status + '）。') }
-        $jsonObj = $respText | ConvertFrom-Json
 
+        $jsonObj = $respText | ConvertFrom-Json
         $content = ''
-        try {
-            $c = $jsonObj.choices[0].message.content
-            if ($c -is [string]) { $content = $c }
-            elseif ($null -ne $c) { foreach ($blk in $c) { if ($null -ne $blk.text) { $content += [string]$blk.text } } }
-        } catch { }
-        if ([string]::IsNullOrWhiteSpace($content)) {
-            throw ('接口返回内容为空。原始响应：' + $respText)
-        }
+        try { $content = [string](& $shape['Parser'] $jsonObj) } catch { }
+        if ([string]::IsNullOrWhiteSpace($content)) { throw ('接口返回内容为空。原始响应：' + $respText) }
         $res.Text = $content
         $res.Ok = $true
     }
@@ -875,8 +1084,38 @@ $script:DsVisionCall = {
     return $res
 }
 
+# 把当前配置解析成「一次识别调用」需要的全部参数（后台任务只认这个，不读全局配置）
+function Get-RecognitionContext {
+    $eng = Resolve-Engine
+    $id = [string]$eng['Id']
+    $p = $eng['Provider']
+    $ps = $script:Config['providers'][$id]
+    $baseUrl = [string]$ps['baseUrl']
+    if ([string]::IsNullOrWhiteSpace($baseUrl)) { $baseUrl = [string]$p['baseUrl'] }
+    $model = [string]$ps['model']
+    if ([string]::IsNullOrWhiteSpace($model)) { $model = [string]$p['model'] }
+    $detail = [string]$ps['detail']
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = 'original' }
+    if (-not [bool]$p['supportsDetail']) { $detail = '' }   # 不认 detail 的服务就别发这个字段
+    return @{
+        providerId  = $id
+        providerName = [string]$p['name']
+        shape       = [string]$p['shape']
+        baseUrl     = $baseUrl
+        model       = $model
+        apiKey      = [string]$ps['apiKey']
+        prompt      = [string]$script:Config['prompt']
+        detail      = $detail
+        temperature = [double]$script:Config['temperature']
+        timeoutSec  = [int]$script:Config['timeoutSec']
+        maxSide     = [int]$script:Config['maxSide']
+        userText    = '请提取这张图片中的全部文字。'
+    }
+}
+
 # =====================================================================
-#  后台任务：调用接口时不让消息循环卡住（热键钩子才不会丢）
+#  后台任务：远程识别不能卡住消息循环（否则热键钩子会被系统回收）
+#  与具体厂商无关：只把「请求格式 + 解析好的参数」丢给后台进程。
 # =====================================================================
 function Start-ApiJob {
     param(
@@ -886,12 +1125,13 @@ function Start-ApiJob {
         [scriptblock]$OnDone
     )
     if ($null -ne $script:ApiJob) { return $false }
-    $cfg = $script:Config['deepseek']
     if ($HardTimeoutSec -le 0) { $HardTimeoutSec = 90 }
+    $ctx = Get-RecognitionContext
+    $shapeName = [string]$ctx['shape']
+    if (-not $script:RequestShapes.ContainsKey($shapeName)) { return $false }
+    $shapeSource = $script:RequestShapes[$shapeName].ToString()
     try {
-        $job = Start-Job -ScriptBlock $script:DsVisionCall -ArgumentList `
-            $ImagePath, ([string]$cfg['apiKey']), ([string]$cfg['baseUrl']), ([string]$cfg['model']), `
-            ([string]$script:Config['prompt']), ([string]$cfg['detail']), ([double]$cfg['temperature']), ([int]$cfg['timeoutSec'])
+        $job = Start-Job -ScriptBlock $script:RemoteVisionCall -ArgumentList $shapeSource, $ctx, $ImagePath
     }
     catch { return $false }
     $script:ApiJob = @{ Job = $job; TempFile = $TempFile; OnDone = $OnDone; Start = (Get-Date); Hard = $HardTimeoutSec }
@@ -967,7 +1207,7 @@ function New-TestImagePng {
 function Start-ConfigProbe {
     param([scriptblock]$OnDone)
     $img = New-TestImagePng
-    $hard = [int]$script:Config['deepseek']['timeoutSec'] + 30
+    $hard = [int]$script:Config['timeoutSec'] + 30
     $ok = Start-ApiJob -ImagePath $img -TempFile $img -HardTimeoutSec $hard -OnDone $OnDone
     if (-not $ok) { try { Remove-Item -LiteralPath $img -Force -ErrorAction SilentlyContinue } catch { } }
     return $ok
@@ -1056,12 +1296,7 @@ function Update-TrayText {
     if ($null -eq $script:Notify) { return }
     $text = $Override
     if ([string]::IsNullOrWhiteSpace($text)) {
-        switch (Resolve-Engine) {
-            'deepseek'     { $label = 'DeepSeek' }
-            'local-noauth' { $label = '本地·未配置Key' }
-            default        { $label = '本地' }
-        }
-        $text = '屏幕OCR助手［' + $label + '］Alt+R 识别 · Alt+R+S 设置'
+        $text = '屏幕OCR助手［' + (Get-EngineLabel) + '］Alt+R 识别 · Alt+R+S 设置'
     }
     if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
     try { $script:Notify.Text = $text } catch { }
@@ -1180,11 +1415,6 @@ function Step-ClipboardDelivery {
     }
 }
 
-function Publish-OcrText {
-    param([string]$Text, [string]$Suffix = '')
-    return (Start-ClipboardDelivery -Text $Text -Suffix $Suffix)
-}
-
 # 框选 -> 识别 -> 复制
 function Invoke-RegionOcr {
     if ($script:Busy) {
@@ -1199,19 +1429,19 @@ function Invoke-RegionOcr {
         if ($null -eq $bmp) { return }
 
         $engine = Resolve-Engine
-        if ($engine -eq 'local-noauth') {
-            Show-NotifyBalloon '未配置 API Key' '当前引擎是 DeepSeek 但还没有 API Key，已回退为本地识别。按 Alt+R+S 可填入 Key。' 'Warning'
-            $engine = 'local'
+        if ($engine['Fallback'] -eq 'missing-key') {
+            Show-NotifyBalloon '未配置 API Key' ('当前引擎是 ' + $engine['Provider']['name'] + ' 但还没有 API Key，已回退为本地识别。按 Alt+R+S 可填入 Key。') 'Warning'
         }
 
-        if ($engine -eq 'deepseek') {
+        if ($engine['Active'] -ne 'local') {
+            $label = [string]$engine['Provider']['name']
             $png = Join-Path ([System.IO.Path]::GetTempPath()) ('imgocr_ds_' + [guid]::NewGuid().ToString('N') + '.png')
-            Save-ImageToPngFile -Image $bmp -Path $png -MaxSide ([int]$script:Config['deepseek']['maxSide'])
+            Save-ImageToPngFile -Image $bmp -Path $png -MaxSide ([int]$script:Config['maxSide'])
             $bmp.Dispose(); $bmp = $null
-            Update-TrayText -Override '屏幕OCR助手：正在用 DeepSeek 识别…'
-            Show-NotifyBalloon '正在识别' '已把截图发送到 DeepSeek 接口，请稍候…' 'Info'
+            Update-TrayText -Override ('屏幕OCR助手：正在用 ' + $label + ' 识别…')
+            Show-NotifyBalloon '正在识别' ('已把截图发送到 ' + $label + ' 接口，请稍候…') 'Info'
             $handedOff = Start-ApiJob -ImagePath $png -TempFile $png `
-                -HardTimeoutSec ([int]$script:Config['deepseek']['timeoutSec'] + 30) `
+                -HardTimeoutSec ([int]$script:Config['timeoutSec'] + 30) `
                 -OnDone { param($r) Complete-ApiOcr -Result $r }
             if (-not $handedOff) {
                 try { Remove-Item -LiteralPath $png -Force -ErrorAction SilentlyContinue } catch { }
@@ -1222,7 +1452,7 @@ function Invoke-RegionOcr {
 
         $text = ''
         try { $text = Invoke-OcrImage -Image $bmp } catch { Show-NotifyBalloon '本地识别出错' $_.Exception.Message 'Error'; return }
-        [void](Publish-OcrText -Text $text -Suffix '（本地）')
+        [void](Start-ClipboardDelivery -Text $text -Suffix '（本地）')
     }
     catch { Show-NotifyBalloon '识别出错' $_.Exception.Message 'Error' }
     finally {
@@ -1233,18 +1463,20 @@ function Invoke-RegionOcr {
 
 function Complete-ApiOcr {
     param($Result)
+    $label = [string](Resolve-Engine)['Provider']['name']
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = '接口' }
     try {
-        if ($null -eq $Result) { Show-NotifyBalloon 'DeepSeek 识别失败' '后台任务异常结束。' 'Error'; return }
+        if ($null -eq $Result) { Show-NotifyBalloon ($label + ' 识别失败') '后台任务异常结束。' 'Error'; return }
         if (-not $Result['Ok']) {
-            Show-NotifyBalloon 'DeepSeek 识别失败' ([string]$Result['Error']) 'Error'
+            Show-NotifyBalloon ($label + ' 识别失败') ([string]$Result['Error']) 'Error'
             return
         }
         $text = Format-OcrText -Text ([string]$Result['Text'])
         $ms = [int]$Result['ElapsedMs']
-        $suffix = '（DeepSeek'
+        $suffix = '（' + $label
         if ($ms -gt 0) { $suffix = $suffix + ' ' + [Math]::Round($ms / 1000.0, 1) + 's' }
         $suffix = $suffix + '）'
-        [void](Publish-OcrText -Text $text -Suffix $suffix)
+        [void](Start-ClipboardDelivery -Text $text -Suffix $suffix)
     }
     finally {
         $script:Busy = $false
@@ -1265,18 +1497,120 @@ function New-Label {
     return $l
 }
 
+# 「标签在左、控件在右」的一行，省掉一堆重复的 Location/Size 样板
+function Add-UiRow {
+    param(
+        [System.Windows.Forms.Control]$Group,
+        [string]$Text,
+        [double]$Y,
+        [System.Windows.Forms.Control]$Control,
+        [double]$LabelX = 14,
+        [double]$ControlX = 130,
+        [double]$Width = 0
+    )
+    [void]$Group.Controls.Add((New-Label $Text $LabelX $Y))
+    $Control.Location = (New-ScaledPoint $ControlX ($Y - 3))
+    if ($Width -gt 0) { $Control.Size = (New-ScaledSize $Width 23) }
+    [void]$Group.Controls.Add($Control)
+    return $Control
+}
+
+function New-UiText { param([string]$Value = '') $t = New-Object System.Windows.Forms.TextBox; $t.Text = $Value; return $t }
+function New-UiNum { param([double]$Value, [double]$Min, [double]$Max) 
+    $n = New-Object System.Windows.Forms.NumericUpDown
+    $n.Minimum = $Min; $n.Maximum = $Max
+    $n.Value = [decimal][Math]::Max($Min, [Math]::Min($Max, $Value))
+    return $n
+}
+function New-UiCombo { param([string[]]$Items, [string]$Selected = '')
+    $c = New-Object System.Windows.Forms.ComboBox
+    $c.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    if ($Items.Count -gt 0) { [void]$c.Items.AddRange($Items) }
+    if (-not [string]::IsNullOrWhiteSpace($Selected)) { $c.SelectedItem = $Selected }
+    if ($null -eq $c.SelectedItem -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 }
+    return $c
+}
+
+# 深拷贝配置：设置窗口里的改动先落在草稿上，取消就整体丢掉
+function Copy-Config {
+    param($Config)
+    $copy = New-DefaultConfig
+    $copy['version'] = $Config['version']
+    $copy['engine'] = $Config['engine']
+    $copy['prompt'] = $Config['prompt']
+    foreach ($k in @('maxSide', 'temperature', 'timeoutSec')) { $copy[$k] = $Config[$k] }
+    foreach ($id in $Config['providers'].Keys) {
+        if (-not $copy['providers'].Contains($id)) { $copy['providers'][$id] = (New-ProviderSettings -Id $id) }
+        foreach ($k in $Config['providers'][$id].Keys) { $copy['providers'][$id][$k] = $Config['providers'][$id][$k] }
+    }
+    return $copy
+}
+
+function Get-DlgProviderId {
+    $d = $script:Dlg
+    if ($null -eq $d) { return 'deepseek' }
+    $i = [int]$d['cboProvider'].SelectedIndex
+    if ($i -lt 0 -or $i -ge $script:DlgProviderIds.Count) { return 'deepseek' }
+    return [string]$script:DlgProviderIds[$i]
+}
+
+# 把界面上当前 provider 的填写内容存回草稿
+function Store-FormToDraft {
+    $d = $script:Dlg
+    if ($null -eq $d -or $null -eq $script:DlgDraft) { return }
+    $id = Get-DlgProviderId
+    $ps = $script:DlgDraft['providers'][$id]
+    $ps['apiKey'] = ([string]$d['txtKey'].Text).Trim()
+    $ps['baseUrl'] = ([string]$d['txtBase'].Text).Trim()
+    $ps['model'] = ([string]$d['txtModel'].Text).Trim()
+    $ps['detail'] = [string]$d['cboDetail'].SelectedItem
+    $script:DlgDraft['prompt'] = [string]$d['txtPrompt'].Text
+    $script:DlgDraft['maxSide'] = [int]$d['numMaxSide'].Value
+    $script:DlgDraft['timeoutSec'] = [int]$d['numTimeout'].Value
+}
+
+# 把草稿里某个 provider 的内容刷到界面上
+function Load-ProviderToForm {
+    param([string]$Id)
+    $d = $script:Dlg
+    if ($null -eq $d -or $null -eq $script:DlgDraft) { return }
+    $p = Get-Provider -Id $Id
+    $ps = $script:DlgDraft['providers'][$Id]
+    if ($null -eq $ps) { $ps = New-ProviderSettings -Id $Id; $script:DlgDraft['providers'][$Id] = $ps }
+    $baseUrl = [string]$ps['baseUrl']; if ([string]::IsNullOrWhiteSpace($baseUrl)) { $baseUrl = [string]$p['baseUrl'] }
+    $model = [string]$ps['model']; if ([string]::IsNullOrWhiteSpace($model)) { $model = [string]$p['model'] }
+    $d['txtBase'].Text = $baseUrl
+    $d['txtModel'].Text = $model
+    $d['txtKey'].Text = [string]$ps['apiKey']
+    $d['cboDetail'].SelectedItem = [string]$ps['detail']
+    if ($null -eq $d['cboDetail'].SelectedItem -and $d['cboDetail'].Items.Count -gt 0) { $d['cboDetail'].SelectedIndex = 0 }
+    $d['numMaxSide'].Value = [decimal][Math]::Max(0, [Math]::Min(8192, [int]$script:DlgDraft['maxSide']))
+    $d['numTimeout'].Value = [decimal][Math]::Max(5, [Math]::Min(300, [int]$script:DlgDraft['timeoutSec']))
+    $d['txtPrompt'].Text = [string]$script:DlgDraft['prompt']
+    $hint = [string]$p['note']
+    if ([string]::IsNullOrWhiteSpace($hint)) { $hint = [string]$p['desc'] }
+    $d['lblProviderNote'].Text = $hint
+}
+
 function Update-SettingsUi {
     $d = $script:Dlg
     if ($null -eq $d) { return }
-    $api = $d['rbApi'].Checked
-    foreach ($k in @('txtBase', 'txtModel', 'cboDetail', 'txtKey', 'chkShow', 'numMaxSide', 'numTimeout', 'lnkKey')) {
-        if ($null -ne $d[$k]) { $d[$k].Enabled = $api }
+    $remote = $d['rbApi'].Checked
+    $p = Get-Provider -Id (Get-DlgProviderId)
+    $needsKey = [bool]$p['keyRequired']
+    $hasDetail = [bool]$p['supportsDetail']
+    foreach ($k in @('cboProvider', 'txtBase', 'txtModel', 'numMaxSide', 'numTimeout', 'lnkKey')) {
+        if ($null -ne $d[$k]) { $d[$k].Enabled = $remote }
     }
-    $d['txtPrompt'].Enabled = $api
-    $d['btnResetPrompt'].Enabled = $api
-    $d['btnTest'].Enabled = ($api -and -not $script:DlgTesting)
-    if ($api) {
-        $d['lblEngineHint'].Text = 'DeepSeek 引擎：截图会通过所填接口上传识别（需联网 + API Key）。'
+    $d['cboDetail'].Enabled = ($remote -and $hasDetail)
+    $d['txtKey'].Enabled = ($remote -and $needsKey)
+    $d['chkShow'].Enabled = ($remote -and $needsKey)
+    $d['txtPrompt'].Enabled = $remote
+    $d['btnResetPrompt'].Enabled = $remote
+    $d['btnTest'].Enabled = ($remote -and -not $script:DlgTesting)
+    if ($remote) {
+        $tail = $(if ($needsKey) { '（需要 API Key，截图会上传）' } else { '（不需要 Key）' })
+        $d['lblEngineHint'].Text = [string]$p['name'] + '：' + [string]$p['desc'] + $tail
     } else {
         $d['lblEngineHint'].Text = '本地引擎：用 Windows 内置 OCR，全程离线、不联网、不花额度。'
     }
@@ -1304,13 +1638,14 @@ function Show-SettingsWindow {
     }
 
     $cfg = $script:Config
-    $ds = $cfg['deepseek']
+    $script:DlgDraft = Copy-Config -Config $cfg
+    $script:DlgProviderIds = @((Get-ProviderCatalog).Keys | Where-Object { $_ -ne 'local' })
     $d = @{}
     $font = Get-UiFont
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '屏幕OCR助手 · 设置'
-    $form.ClientSize = (New-ScaledSize 624 640)
+    $form.ClientSize = (New-ScaledSize 624 670)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
     $form.MaximizeBox = $false
@@ -1321,7 +1656,7 @@ function Show-SettingsWindow {
     $form.TopMost = $true
     $d['Form'] = $form
 
-    [void]$form.Controls.Add((New-Label '识别引擎（截图默认走本地，可切换为接口）' 16 12 560 -Bold))
+    [void]$form.Controls.Add((New-Label '识别引擎（截图默认走本地，可随时切到别的模型接口）' 16 12 560 -Bold))
 
     $rbLocal = New-Object System.Windows.Forms.RadioButton
     $rbLocal.Text = '本地识别（Windows 内置 OCR）— 离线、免费、不上传【默认】'
@@ -1330,7 +1665,7 @@ function Show-SettingsWindow {
     $d['rbLocal'] = $rbLocal
 
     $rbApi = New-Object System.Windows.Forms.RadioButton
-    $rbApi.Text = 'DeepSeek 接口识别 — 上传截图，复杂排版 / 小字更准（需 API Key）'
+    $rbApi.Text = '接口识别（远程模型）— 上传截图，复杂排版 / 小字更准'
     $rbApi.Location = (New-ScaledPoint 20 62)
     $rbApi.AutoSize = $true
     $d['rbApi'] = $rbApi
@@ -1345,91 +1680,74 @@ function Show-SettingsWindow {
     [void]$form.Controls.Add($rbApi)
     [void]$form.Controls.Add($lblEngineHint)
 
-    # ---- DeepSeek 接口 ----
+    # ---- 接口（远程模型）----
     $gbApi = New-Object System.Windows.Forms.GroupBox
-    $gbApi.Text = 'DeepSeek 接口设置'
+    $gbApi.Text = '接口识别设置（可换成别的模型服务）'
     $gbApi.Location = (New-ScaledPoint 12 110)
-    $gbApi.Size = (New-ScaledSize 600 246)
+    $gbApi.Size = (New-ScaledSize 600 272)
     [void]$form.Controls.Add($gbApi)
 
-    [void]$gbApi.Controls.Add((New-Label '接口地址' 14 30))
-    $txtBase = New-Object System.Windows.Forms.TextBox
-    $txtBase.Location = (New-ScaledPoint 130 27)
-    $txtBase.Size = (New-ScaledSize 450 23)
-    $txtBase.Text = [string]$ds['baseUrl']
+    $providerItems = @()
+    foreach ($id in $script:DlgProviderIds) {
+        $p = Get-Provider -Id $id
+        $providerItems += ([string]$p['name'] + '  —  ' + [string]$p['desc'])
+    }
+    $cboProvider = New-UiCombo -Items $providerItems
+    $d['cboProvider'] = $cboProvider
+    [void](Add-UiRow $gbApi '识别服务' 30 $cboProvider 14 130 330)
+    $lblProviderNote = New-Object System.Windows.Forms.Label
+    $lblProviderNote.Location = (New-ScaledPoint 470 27)
+    $lblProviderNote.AutoSize = $true
+    $lblProviderNote.ForeColor = [System.Drawing.Color]::DimGray
+    $d['lblProviderNote'] = $lblProviderNote
+    [void]$gbApi.Controls.Add($lblProviderNote)
+
+    $txtBase = New-UiText
     $d['txtBase'] = $txtBase
-    [void]$gbApi.Controls.Add($txtBase)
+    [void](Add-UiRow $gbApi '接口地址' 60 $txtBase 14 130 450)
 
-    [void]$gbApi.Controls.Add((New-Label '模型' 14 60))
-    $txtModel = New-Object System.Windows.Forms.TextBox
-    $txtModel.Location = (New-ScaledPoint 130 57)
-    $txtModel.Size = (New-ScaledSize 190 23)
-    $txtModel.Text = [string]$ds['model']
+    $txtModel = New-UiText
     $d['txtModel'] = $txtModel
-    [void]$gbApi.Controls.Add($txtModel)
-
-    [void]$gbApi.Controls.Add((New-Label '图片细节' 336 60))
-    $cboDetail = New-Object System.Windows.Forms.ComboBox
-    $cboDetail.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-    $cboDetail.Location = (New-ScaledPoint 405 57)
-    $cboDetail.Size = (New-ScaledSize 175 23)
-    [void]$cboDetail.Items.AddRange(@('original', 'high', 'low', 'auto'))
-    $cboDetail.SelectedItem = [string]$ds['detail']
-    if ($null -eq $cboDetail.SelectedItem) { $cboDetail.SelectedIndex = 0 }
+    [void](Add-UiRow $gbApi '模型' 90 $txtModel 14 130 190)
+    $cboDetail = New-UiCombo -Items @('original', 'high', 'low', 'auto')
     $d['cboDetail'] = $cboDetail
-    [void]$gbApi.Controls.Add($cboDetail)
+    [void](Add-UiRow $gbApi '图片细节' 90 $cboDetail 336 405 175)
 
-    [void]$gbApi.Controls.Add((New-Label 'API Key' 14 90))
-    $txtKey = New-Object System.Windows.Forms.TextBox
-    $txtKey.Location = (New-ScaledPoint 130 87)
-    $txtKey.Size = (New-ScaledSize 310 23)
-    $txtKey.Text = [string]$ds['apiKey']
+    $txtKey = New-UiText
     $txtKey.UseSystemPasswordChar = $true
     $d['txtKey'] = $txtKey
-    [void]$gbApi.Controls.Add($txtKey)
+    [void](Add-UiRow $gbApi 'API Key' 120 $txtKey 14 130 310)
 
     $chkShow = New-Object System.Windows.Forms.CheckBox
     $chkShow.Text = '显示'
-    $chkShow.Location = (New-ScaledPoint 452 89)
+    $chkShow.Location = (New-ScaledPoint 452 119)
     $chkShow.AutoSize = $true
     $d['chkShow'] = $chkShow
     [void]$gbApi.Controls.Add($chkShow)
 
-    [void]$gbApi.Controls.Add((New-Label '图片最长边' 14 120))
-    $numMaxSide = New-Object System.Windows.Forms.NumericUpDown
-    $numMaxSide.Location = (New-ScaledPoint 130 117)
-    $numMaxSide.Size = (New-ScaledSize 80 23)
-    $numMaxSide.Minimum = 0
-    $numMaxSide.Maximum = 8192
-    $numMaxSide.Value = [decimal][Math]::Max(0, [Math]::Min(8192, [int]$ds['maxSide']))
+    $numMaxSide = New-UiNum -Value 1920 -Min 0 -Max 8192
     $d['numMaxSide'] = $numMaxSide
-    [void]$gbApi.Controls.Add($numMaxSide)
-    [void]$gbApi.Controls.Add((New-Label '像素（0 = 不压缩；超出会等比缩小后再上传）' 218 120))
+    [void](Add-UiRow $gbApi '图片最长边' 150 $numMaxSide 14 130 80)
+    [void]$gbApi.Controls.Add((New-Label '像素（0 = 不压缩；超出会等比缩小后再上传）' 218 150))
 
-    [void]$gbApi.Controls.Add((New-Label '超时' 14 150))
-    $numTimeout = New-Object System.Windows.Forms.NumericUpDown
-    $numTimeout.Location = (New-ScaledPoint 130 147)
-    $numTimeout.Size = (New-ScaledSize 80 23)
-    $numTimeout.Minimum = 5
-    $numTimeout.Maximum = 300
-    $numTimeout.Value = [decimal][Math]::Max(5, [Math]::Min(300, [int]$ds['timeoutSec']))
+    $numTimeout = New-UiNum -Value 60 -Min 5 -Max 300
     $d['numTimeout'] = $numTimeout
-    [void]$gbApi.Controls.Add($numTimeout)
-    [void]$gbApi.Controls.Add((New-Label '秒（单次请求）' 218 150))
+    [void](Add-UiRow $gbApi '超时' 180 $numTimeout 14 130 80)
+    [void]$gbApi.Controls.Add((New-Label '秒（单次请求）' 218 180))
 
     $lnkKey = New-Object System.Windows.Forms.LinkLabel
-    $lnkKey.Text = '→ 还没有 Key？点这里打开 DeepSeek 开放平台申请'
-    $lnkKey.Location = (New-ScaledPoint 130 180)
+    $lnkKey.Text = '→ 点这里打开当前识别服务的 Key 申请页 / 模型列表'
+    $lnkKey.Location = (New-ScaledPoint 130 210)
     $lnkKey.AutoSize = $true
     $d['lnkKey'] = $lnkKey
     [void]$gbApi.Controls.Add($lnkKey)
 
-    [void]$gbApi.Controls.Add((New-Label 'Key 只保存在本机配置文件里，不会发给除上面接口地址以外的任何地方。' 14 208))
+    [void]$gbApi.Controls.Add((New-Label 'Key 只保存在本机配置文件里，不会发给除上面接口地址以外的任何地方。' 14 238))
 
     # ---- 提示词 ----
     $gbPrompt = New-Object System.Windows.Forms.GroupBox
     $gbPrompt.Text = '上下文提示词（写给模型的要求；仅接口引擎生效，可自行修改）'
-    $gbPrompt.Location = (New-ScaledPoint 12 364)
+    $gbPrompt.Location = (New-ScaledPoint 12 390)
     $gbPrompt.Size = (New-ScaledSize 600 186)
     [void]$form.Controls.Add($gbPrompt)
 
@@ -1455,7 +1773,7 @@ function Show-SettingsWindow {
     # ---- 底部 ----
     # 状态栏独占一整行，否则识别结果会被挤在按钮旁边截断
     $lblStatus = New-Object System.Windows.Forms.Label
-    $lblStatus.Location = (New-ScaledPoint 16 556)
+    $lblStatus.Location = (New-ScaledPoint 16 582)
     $lblStatus.Size = (New-ScaledSize 596 20)
     $lblStatus.AutoEllipsis = $true
     $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
@@ -1464,21 +1782,21 @@ function Show-SettingsWindow {
 
     $btnTest = New-Object System.Windows.Forms.Button
     $btnTest.Text = '测试接口'
-    $btnTest.Location = (New-ScaledPoint 302 584)
+    $btnTest.Location = (New-ScaledPoint 302 610)
     $btnTest.Size = (New-ScaledSize 100 32)
     $d['btnTest'] = $btnTest
     [void]$form.Controls.Add($btnTest)
 
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Text = '保存并关闭'
-    $btnSave.Location = (New-ScaledPoint 408 584)
+    $btnSave.Location = (New-ScaledPoint 408 610)
     $btnSave.Size = (New-ScaledSize 110 32)
     $d['btnSave'] = $btnSave
     [void]$form.Controls.Add($btnSave)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = '取消'
-    $btnCancel.Location = (New-ScaledPoint 524 584)
+    $btnCancel.Location = (New-ScaledPoint 524 610)
     $btnCancel.Size = (New-ScaledSize 88 32)
     $d['btnCancel'] = $btnCancel
     [void]$form.Controls.Add($btnCancel)
@@ -1489,12 +1807,21 @@ function Show-SettingsWindow {
 
     $rbLocal.add_CheckedChanged({ Update-SettingsUi })
     $rbApi.add_CheckedChanged({ Update-SettingsUi })
+    $cboProvider.add_SelectedIndexChanged({
+        # 切服务前先把当前填写内容存回草稿，再把新服务的值刷上来
+        Store-FormToDraft
+        Load-ProviderToForm -Id (Get-DlgProviderId)
+        Update-SettingsUi
+    })
     $chkShow.add_CheckedChanged({
         $d = $script:Dlg
         if ($null -ne $d) { $d['txtKey'].UseSystemPasswordChar = -not $d['chkShow'].Checked }
     })
     $lnkKey.add_LinkClicked({
-        try { Start-Process 'https://platform.deepseek.com/api_keys' } catch { }
+        $p = Get-Provider -Id (Get-DlgProviderId)
+        $url = [string]$p['keyUrl']
+        if ([string]::IsNullOrWhiteSpace($url)) { Set-SettingsStatus '这个服务没有预设链接，请直接填接口地址。'; return }
+        try { Start-Process $url } catch { }
     })
     $btnResetPrompt.add_Click({
         $d = $script:Dlg
@@ -1503,16 +1830,12 @@ function Show-SettingsWindow {
     $btnCancel.add_Click({ $script:DlgForm.Close() })
 
     $btnTest.add_Click({
-        $d = $script:Dlg
-        if ($null -eq $d) { return }
-        $probeCfg = Read-SettingsForm -Silent
-        if ($null -eq $probeCfg) { return }
-        $savedKey = $script:Config['deepseek']['apiKey']
-        $savedBase = $script:Config['deepseek']['baseUrl']
-        $savedModel = $script:Config['deepseek']['model']
-        $script:Config['deepseek']['apiKey'] = $probeCfg['deepseek']['apiKey']
-        $script:Config['deepseek']['baseUrl'] = $probeCfg['deepseek']['baseUrl']
-        $script:Config['deepseek']['model'] = $probeCfg['deepseek']['model']
+        if ($null -eq $script:Dlg) { return }
+        Store-FormToDraft
+        if ($null -eq (Read-SettingsForm -Silent)) { return }
+        # 用界面上正在编辑的那份配置去测，不动已保存的配置
+        $saved = $script:Config
+        $script:Config = Copy-Config -Config $script:DlgDraft
         $script:DlgTesting = $true
         Set-SettingsStatus '正在调用接口（会用一张测试图真跑一次识别）…'
         Update-SettingsUi
@@ -1538,9 +1861,7 @@ function Show-SettingsWindow {
             Set-SettingsStatus '已有任务在跑，请稍后再试。'
             Update-SettingsUi
         }
-        $script:Config['deepseek']['apiKey'] = $savedKey
-        $script:Config['deepseek']['baseUrl'] = $savedBase
-        $script:Config['deepseek']['model'] = $savedModel
+        $script:Config = $saved
     })
 
     $btnSave.add_Click({ [void](Save-SettingsForm) })
@@ -1556,36 +1877,54 @@ function Show-SettingsWindow {
     $script:Dlg = $d
     $script:DlgForm = $form
 
-    if ($cfg['engine'] -eq 'deepseek') { $rbApi.Checked = $true } else { $rbLocal.Checked = $true }
+    # 打开时定位到当前引擎：radio + 服务下拉框 + 该服务自己的设置
+    $engineId = [string]$cfg['engine']
+    if ($engineId -eq 'local') {
+        $rbLocal.Checked = $true
+    } else {
+        $rbApi.Checked = $true
+        $idx = [Array]::IndexOf($script:DlgProviderIds, $engineId)
+        if ($idx -lt 0) { $idx = 0 }
+        $cboProvider.SelectedIndex = $idx
+    }
+    Load-ProviderToForm -Id (Get-DlgProviderId)
     Update-SettingsUi
 
     try { $form.Show() } catch { }
     try { $form.Activate(); $form.BringToFront() } catch { }
 }
 
-# 从窗体读取配置；-Silent 时不弹错误框，只返回 $null
+# 校验设置窗口里的内容；-Silent 时不弹错误框，只返回 $null
 function Read-SettingsForm {
     param([switch]$Silent)
     $d = $script:Dlg
     if ($null -eq $d) { return $null }
-    $cfg = New-DefaultConfig
-    if ($d['rbApi'].Checked) { $cfg['engine'] = 'deepseek' } else { $cfg['engine'] = 'local' }
-    $cfg['prompt'] = [string]$d['txtPrompt'].Text
-    if ([string]::IsNullOrWhiteSpace([string]$cfg['prompt'])) { throw '提示词不能为空（可点「恢复默认提示词」）。' }
-    $cfg['deepseek']['apiKey'] = ([string]$d['txtKey'].Text).Trim()
-    $cfg['deepseek']['baseUrl'] = ([string]$d['txtBase'].Text).Trim()
-    $cfg['deepseek']['model'] = ([string]$d['txtModel'].Text).Trim()
-    $cfg['deepseek']['detail'] = [string]$d['cboDetail'].SelectedItem
-    $cfg['deepseek']['maxSide'] = [int]$d['numMaxSide'].Value
-    $cfg['deepseek']['timeoutSec'] = [int]$d['numTimeout'].Value
-    $cfg['deepseek']['temperature'] = [double]$script:Config['deepseek']['temperature']
+    Store-FormToDraft
+    $cfg = Copy-Config -Config $script:DlgDraft
+    if ($d['rbApi'].Checked) { $cfg['engine'] = Get-DlgProviderId } else { $cfg['engine'] = 'local' }
 
-    if ([string]::IsNullOrWhiteSpace([string]$cfg['deepseek']['baseUrl'])) { $cfg['deepseek']['baseUrl'] = 'https://api.deepseek.com' }
-    if ([string]::IsNullOrWhiteSpace([string]$cfg['deepseek']['model'])) { $cfg['deepseek']['model'] = 'deepseek-flash' }
-    if ($cfg['engine'] -eq 'deepseek' -and [string]::IsNullOrWhiteSpace([string]$cfg['deepseek']['apiKey'])) {
+    if ([string]::IsNullOrWhiteSpace([string]$cfg['prompt'])) {
         if ($Silent) { return $null }
-        [void][System.Windows.Forms.MessageBox]::Show('引擎选了 DeepSeek，但 API Key 还是空的。请填入 Key，或改回本地引擎。', '还差一步', 'OK', 'Warning')
+        [void][System.Windows.Forms.MessageBox]::Show('提示词不能为空（可点「恢复默认提示词」）。', '还差一步', 'OK', 'Warning')
         return $null
+    }
+
+    $id = [string]$cfg['engine']
+    if ($id -ne 'local') {
+        $p = Get-Provider -Id $id
+        $ps = $cfg['providers'][$id]
+        if ([string]::IsNullOrWhiteSpace([string]$ps['baseUrl'])) { $ps['baseUrl'] = [string]$p['baseUrl'] }
+        if ([string]::IsNullOrWhiteSpace([string]$ps['model'])) { $ps['model'] = [string]$p['model'] }
+        if ([string]::IsNullOrWhiteSpace([string]$ps['baseUrl']) -or [string]::IsNullOrWhiteSpace([string]$ps['model'])) {
+            if ($Silent) { return $null }
+            [void][System.Windows.Forms.MessageBox]::Show('还没填接口地址或模型名。', '还差一步', 'OK', 'Warning')
+            return $null
+        }
+        if ([bool]$p['keyRequired'] -and [string]::IsNullOrWhiteSpace([string]$ps['apiKey'])) {
+            if ($Silent) { return $null }
+            [void][System.Windows.Forms.MessageBox]::Show(('选了 ' + [string]$p['name'] + ' 但 API Key 还是空的。请填入 Key，或改回本地引擎。'), '还差一步', 'OK', 'Warning')
+            return $null
+        }
     }
     return $cfg
 }
@@ -1604,23 +1943,25 @@ function Save-SettingsForm {
     try { if ($null -ne $script:DlgForm -and -not $script:DlgForm.IsDisposed) { $script:DlgForm.Close() } } catch { }
 
     $engine = Resolve-Engine
+    $label = [string]$engine['Provider']['name']
     # 只有托盘在跑的时候才做「自动接入」测速（独立打开设置窗口时没有气泡可显示）
-    if ($engine -eq 'deepseek' -and $null -ne $script:Notify) {
-        # 输入 Key 后自动接入：后台真跑一次识别，结果用托盘气泡回报
+    if ($engine['Active'] -ne 'local' -and $null -ne $script:Notify) {
+        # 填完 Key 自动接入：后台真跑一次识别，结果用托盘气泡回报
         $started = Start-ConfigProbe -OnDone {
             param($r)
+            $cur = [string](Resolve-Engine)['Provider']['name']
             if ($null -ne $r -and $r['Ok']) {
-                Show-NotifyBalloon '已接入 DeepSeek' ('接口测试通过（' + [int]$r['ElapsedMs'] + ' ms），之后 Alt+R 就走接口识别。配置：' + $script:Config['deepseek']['baseUrl']) 'Info'
+                Show-NotifyBalloon ('已接入 ' + $cur) ('接口测试通过（' + [int]$r['ElapsedMs'] + ' ms），之后 Alt+R 就走接口识别。配置：' + (Get-RecognitionContext)['baseUrl']) 'Info'
             } else {
                 $msg = '未知错误'
                 if ($null -ne $r -and $r['Error']) { $msg = [string]$r['Error'] }
-                Show-NotifyBalloon 'DeepSeek 接入失败' ($msg + '　（Alt+R+S 可回去检查 Key / 接口地址）') 'Error'
+                Show-NotifyBalloon ($cur + ' 接入失败') ($msg + '　（Alt+R+S 可回去检查 Key / 接口地址）') 'Error'
             }
         }
         if ($started) {
-            Show-NotifyBalloon '设置已保存' '已切到 DeepSeek 引擎，正在后台测试接口连接…' 'Info'
+            Show-NotifyBalloon '设置已保存' ('已切到 ' + $label + '，正在后台测试接口连接…') 'Info'
         } else {
-            Show-NotifyBalloon '设置已保存' '已切到 DeepSeek 引擎（接口测试被其他任务占用，稍后 Alt+R 时会真正调用）。' 'Info'
+            Show-NotifyBalloon '设置已保存' ('已切到 ' + $label + '（接口测试被其他任务占用，稍后 Alt+R 时会真正调用）。') 'Info'
         }
     } else {
         Show-NotifyBalloon '设置已保存' ('当前引擎：本地 OCR。配置文件：' + $path) 'Info'
@@ -1634,13 +1975,6 @@ function Save-SettingsForm {
 function Get-AutoStartCommand {
     $exe = Join-Path $PSHOME 'powershell.exe'
     return ('"' + $exe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File "' + $PSCommandPath + '"')
-}
-
-function Test-AutoStart {
-    try {
-        $v = Get-ItemPropertyValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $script:AutoStartKey -ErrorAction Stop
-        return ($null -ne $v -and ($v -like '*ImgOcrAssistant*'))
-    } catch { return $false }
 }
 
 function Set-AutoStart {
@@ -1710,13 +2044,14 @@ function Build-TrayUi {
     })
     [void]$menu.Items.Add($miOpenCfg)
 
-    $miMode = New-Object System.Windows.Forms.ToolStripMenuItem('识别引擎：本地 OCR')
-    $miMode.add_Click({
-        if ($script:Config['engine'] -eq 'local') { $script:Config['engine'] = 'deepseek' } else { $script:Config['engine'] = 'local' }
-        try { [void](Export-Config -Config $script:Config) } catch { }
-        Update-TrayText
-        Show-NotifyBalloon '已切换引擎' ('当前：' + $(if ($script:Config['engine'] -eq 'deepseek') { 'DeepSeek 接口' } else { '本地 OCR' })) 'Info'
-    })
+    # 引擎切换做成子菜单：本地 + 目录里的每个远程服务，直接点选，不用进设置窗口
+    $miMode = New-Object System.Windows.Forms.ToolStripMenuItem('识别引擎')
+    [void]$miMode.DropDownItems.Add((New-EngineMenuItem -Id 'local' -Text '本地 OCR'))
+    [void]$miMode.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    foreach ($provId in (Get-ProviderCatalog).Keys) {
+        if ($provId -eq 'local') { continue }
+        [void]$miMode.DropDownItems.Add((New-EngineMenuItem -Id $provId -Text ([string](Get-Provider -Id $provId)['name'])))
+    }
     [void]$menu.Items.Add($miMode)
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
@@ -1725,10 +2060,40 @@ function Build-TrayUi {
     [void]$menu.Items.Add($miExit)
 
     $menu.add_Opening({
-        $miMode.Text = '识别引擎：' + $(if ($script:Config['engine'] -eq 'deepseek') { 'DeepSeek 接口' } else { '本地 OCR' })
+        $active = [string](Resolve-Engine)['Active']
+        $miMode.Text = '识别引擎：' + (Get-EngineLabel)
+        $miModeLocal.Checked = ($active -eq 'local')
+        foreach ($mi in $miMode.DropDownItems) {
+            if ($null -ne $mi.Tag) { $mi.Checked = ([string]$mi.Tag -eq $active) }
+        }
         $miRecopy.Enabled = (-not [string]::IsNullOrEmpty($script:LastOcrText))
     })
     $script:Notify.ContextMenuStrip = $menu
+}
+
+# 收一个带 id 的菜单项；用强类型委托拿 sender，避免闭包变量被最后一项覆盖
+function New-EngineMenuItem {
+    param([string]$Id, [string]$Text)
+    $mi = New-Object System.Windows.Forms.ToolStripMenuItem($Text)
+    $mi.Tag = $Id
+    $mi.add_Click([System.EventHandler]{
+        param($sender, $e)
+        Set-ActiveEngine -Id ([string]$sender.Tag)
+    })
+    return $mi
+}
+
+# 切换当前引擎并落盘（供托盘菜单使用）
+function Set-ActiveEngine {
+    param([string]$Id)
+    if (-not (Test-ProviderId -Id $Id)) { return }
+    $script:Config['engine'] = $Id
+    try { [void](Export-Config -Config $script:Config) } catch { }
+    $eng = Resolve-Engine
+    Update-TrayText
+    $tail = ''
+    if ($eng['Fallback'] -eq 'missing-key') { $tail = '（还没填 API Key，会先用本地识别；按 Alt+R+S 填）' }
+    Show-NotifyBalloon '已切换引擎' ('当前：' + (Get-EngineLabel -Engine $eng) + $tail) 'Info'
 }
 
 function Start-ConfigWatcher {
@@ -1769,9 +2134,9 @@ function Start-Assistant {
     try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
 
     $engine = Resolve-Engine
-    if ($engine -eq 'local') {
+    if ($engine['Active'] -eq 'local') {
         $initOk = Initialize-OcrEnvironment
-        if (-not $initOk) { Write-Warning '本地 OCR 初始化失败（缺少识别语言），可改用 DeepSeek 接口引擎。' }
+        if (-not $initOk) { Write-Warning '本地 OCR 初始化失败（缺少识别语言），可改用接口引擎（Alt+R+S）。' }
     }
 
     $script:Busy = $false
@@ -1824,78 +2189,67 @@ function Start-SettingsOnly {
 #  冒烟 / 自检
 # =====================================================================
 # 剪贴板自检：分别验 WinForms 和原生 Win32 两条写入通路
+# 跑一项剪贴板写入检查：写入 -> 用原生读回 -> （可选）再用 OLE 读回
+function Test-ClipboardRoundTrip {
+    param([string]$Name, [string]$Text, [switch]$CheckOle)
+    $result = @{ Name = $Name; Ok = $false; Info = '' }
+    try {
+        $r = Set-ClipboardText -Text $Text -Attempts 3
+        if (-not $r['Ok']) { $result.Info = $r['Error']; return $result }
+        $result.Info = 'via=' + $r['Via']
+        $back = [ImgOcrNative.Clip]::GetText()
+        if ($back -ne $Text) {
+            $len = $(if ($null -eq $back) { 'null' } else { [string]$back.Length })
+            $result.Info = $result.Info + ' 回读不一致(len=' + $len + ')'
+            return $result
+        }
+        if ($CheckOle) {
+            try {
+                $viaOle = [System.Windows.Forms.Clipboard]::GetText()
+                if ($viaOle -ne $Text) { $result.Info = $result.Info + ' OLE 回读不一致'; return $result }
+                $result.Info = $result.Info + '，Win32+OLE 都能读'
+            } catch { $result.Info = $result.Info + '（OLE 读取失败：' + $_.Exception.Message + '）' }
+        }
+        $result.Ok = $true
+    } catch { $result.Info = $_.Exception.Message }
+    return $result
+}
+
 function Invoke-ClipboardTest {
     Write-Output ('CLIPTEST sta=' + [System.Threading.Thread]::CurrentThread.GetApartmentState())
     $stamp = 'IMGOCR-CLIP-' + (Get-Date).ToString('HHmmss')
     $pass = 0; $fail = 0
 
-    # 1) 裸探针：只试一次，不带重试。失败不算问题 —— 说明别的程序（微信、剪贴板工具、
-    #    远程桌面等）恰好在这一瞬间占着剪贴板，这正是后面要重试的原因。
-    $wfRaw = ''
-    try { [System.Windows.Forms.Clipboard]::SetText($stamp + '-WF-RAW'); $wfRaw = 'OK' }
+    # 裸探针：只试一次，不带重试。失败不算问题 —— 说明别的程序（微信、剪贴板工具、
+    # 远程桌面等）恰好在这一瞬间占着剪贴板，这正是要重试的原因。
+    $wfRaw = 'OK'
+    try { [System.Windows.Forms.Clipboard]::SetText($stamp + '-WF-RAW') }
     catch { $wfRaw = '被占用(' + $_.Exception.Message + ')' }
     Write-Output ('CLIPTEST raw-winforms-single-try=' + $wfRaw + '   [仅参考，不判定成败]')
 
-    $ntRaw = ''
+    $ntRaw = 'OK'
     try {
         $e = [ImgOcrNative.Clip]::SetText($stamp + '-NT-RAW')
-        $ntRaw = $(if ($null -eq $e) { 'OK' } else { '被占用(' + $e + ')' })
+        if ($null -ne $e) { $ntRaw = '被占用(' + $e + ')' }
     } catch { $ntRaw = '被占用(' + $_.Exception.Message + ')' }
     Write-Output ('CLIPTEST raw-win32-single-try=' + $ntRaw + '    [仅参考，不判定成败]')
 
-    # 2) 实际使用的策略（带重试）—— 这几项才算成败
-    $ok = $false; $info = ''
-    try {
-        $r = Set-ClipboardText -Text ($stamp + '-STRATEGY') -Attempts 3
-        if ($r['Ok']) {
-            $back = [ImgOcrNative.Clip]::GetText()
-            $ok = ($back -eq $stamp + '-STRATEGY')
-            $info = 'via=' + $r['Via']
-            if ($ok) {
-                # 用 OLE/WinForms 再读一次，确认别的程序也能拿到
-                try {
-                    $viaOle = [System.Windows.Forms.Clipboard]::GetText()
-                    if ($viaOle -ne $stamp + '-STRATEGY') { $ok = $false; $info = 'OLE-readback=[' + $viaOle + ']' }
-                    else { $info = $info + '，Win32+OLE 都能读' }
-                } catch { $info = $info + '（OLE 读取失败：' + $_.Exception.Message + '）' }
-            } else { $info = $info + ' readback-mismatch' }
-        } else { $info = $r['Error'] }
-    } catch { $info = $_.Exception.Message }
-    if ($ok) { $pass++ } else { $fail++ }
-    Write-Output ('CLIPTEST strategy-retry=' + $(if ($ok) { 'OK ' + $info } else { 'FAIL ' + $info }))
-
-    # 3) 多行中文（OCR 的典型内容）
+    # 实际使用的策略（带重试）—— 这几项才算成败
     $cn = [string]::Join('', [char[]](0x7B2C, 0x4E8C, 0x884C, 0xFF1A, 0x4FDD, 0x7559, 0x6362, 0x884C))
-    $sample = "OCR TEST 12345`r`n$cn`r`nEnd line three"
-    $ok = $false; $info = ''
-    try {
-        $r = Set-ClipboardText -Text $sample -Attempts 3
-        if ($r['Ok']) {
-            $back = [ImgOcrNative.Clip]::GetText()
-            $ok = ($back -eq $sample)
-            $info = 'via=' + $r['Via']
-            if (-not $ok) { $info = $info + ' readback-mismatch' }
-        } else { $info = $r['Error'] }
-    } catch { $info = $_.Exception.Message }
-    if ($ok) { $pass++ } else { $fail++ }
-    Write-Output ('CLIPTEST multiline-cn=' + $(if ($ok) { 'OK ' + $info } else { 'FAIL ' + $info }))
+    $cases = @(
+        @{ name = 'strategy-retry'; text = ($stamp + '-STRATEGY'); ole = $true },
+        @{ name = 'multiline-cn';  text = "OCR TEST 12345`r`n$cn`r`nEnd line three"; ole = $false },
+        @{ name = 'large-text';    text = (('IMGOCR-BIG-' + $stamp + "`r`n") * 2000); ole = $false }
+    )
+    foreach ($c in $cases) {
+        $r = Test-ClipboardRoundTrip -Name $c['name'] -Text $c['text'] -CheckOle:$c['ole']
+        if ($r['Ok']) { $pass++ } else { $fail++ }
+        $extra = ''
+        if ($c['name'] -eq 'large-text') { $extra = 'len=' + ([string]$c['text']).Length + ' ' }
+        Write-Output ('CLIPTEST ' + $c['name'] + '=' + $(if ($r['Ok']) { 'OK ' } else { 'FAIL ' }) + $extra + $r['Info'])
+    }
 
-    # 4) 大文本（长截图可能一次几千行）
-    $big = ('IMGOCR-BIG-' + $stamp + "`r`n") * 2000
-    $ok = $false; $info = ''
-    try {
-        $r = Set-ClipboardText -Text $big -Attempts 3
-        if ($r['Ok']) {
-            $back = [ImgOcrNative.Clip]::GetText()
-            $ok = ($back -eq $big)
-            $info = ('len=' + $big.Length + ' via=' + $r['Via'])
-            if (-not $ok) { $info = $info + ' readback-mismatch(len=' + $(if ($null -eq $back) { 'null' } else { $back.Length }) + ')' }
-        } else { $info = $r['Error'] }
-    } catch { $info = $_.Exception.Message }
-    if ($ok) { $pass++ } else { $fail++ }
-    Write-Output ('CLIPTEST large-text=' + $(if ($ok) { 'OK ' + $info } else { 'FAIL ' + $info }))
-
-    # 5) 当前剪贴板里是什么（判断是不是被别的程序接管了）
+    # 当前剪贴板里是什么（判断是不是被别的程序接管了）
     $cur = [ImgOcrNative.Clip]::GetText()
     if ($null -eq $cur) { Write-Output 'CLIPTEST current=<非文本或读不到>' }
     else {
@@ -1945,32 +2299,28 @@ function Invoke-ChordTest {
     $alt = [ImgOcrNative.KeyChord]::VkAlt
     $r = [ImgOcrNative.KeyChord]::VkR
     $s = [ImgOcrNative.KeyChord]::VkS
+    $x = 0x58
 
-    # 1) 按住 Alt -> R -> 松开 Alt   => 识别 1 次
-    $chord.SimulateKey($alt, $true); $chord.SimulateKey($r, $true); $chord.SimulateKey($r, $false); $chord.SimulateKey($alt, $false)
-    Write-Output ('CHORDTEST case1 ocr=' + $script:ChordOcrHits + ' set=' + $script:ChordSetHits + ' ' + $(if ($script:ChordOcrHits -eq 1 -and $script:ChordSetHits -eq 0) { 'OK' } else { 'FAIL' }))
-
-    # 2) 按住 Alt -> R -> S -> 松开 => 只触发设置
-    $script:ChordOcrHits = 0; $script:ChordSetHits = 0
-    $chord.SimulateKey($alt, $true); $chord.SimulateKey($r, $true); $chord.SimulateKey($s, $true); $chord.SimulateKey($s, $false); $chord.SimulateKey($r, $false); $chord.SimulateKey($alt, $false)
-    Write-Output ('CHORDTEST case2 ocr=' + $script:ChordOcrHits + ' set=' + $script:ChordSetHits + ' ' + $(if ($script:ChordOcrHits -eq 0 -and $script:ChordSetHits -eq 1) { 'OK' } else { 'FAIL' }))
-
-    # 3) 按住 Alt -> R -> 其他键(X) -> 松开 => 都不触发
-    $script:ChordOcrHits = 0; $script:ChordSetHits = 0
-    $chord.SimulateKey($alt, $true); $chord.SimulateKey($r, $true); $chord.SimulateKey(0x58, $true); $chord.SimulateKey(0x58, $false); $chord.SimulateKey($alt, $false)
-    Write-Output ('CHORDTEST case3 ocr=' + $script:ChordOcrHits + ' set=' + $script:ChordSetHits + ' ' + $(if ($script:ChordOcrHits -eq 0 -and $script:ChordSetHits -eq 0) { 'OK' } else { 'FAIL' }))
-
-    # 4) 不按 Alt 直接按 R / S => 都不触发
-    $script:ChordOcrHits = 0; $script:ChordSetHits = 0
-    $chord.SimulateKey($r, $true); $chord.SimulateKey($r, $false); $chord.SimulateKey($s, $true); $chord.SimulateKey($s, $false)
-    Write-Output ('CHORDTEST case4 ocr=' + $script:ChordOcrHits + ' set=' + $script:ChordSetHits + ' ' + $(if ($script:ChordOcrHits -eq 0 -and $script:ChordSetHits -eq 0) { 'OK' } else { 'FAIL' }))
-
-    # 5) 连续两次 Alt+R => 识别 2 次
-    $script:ChordOcrHits = 0; $script:ChordSetHits = 0
-    $chord.SimulateKey($alt, $true); $chord.SimulateKey($r, $true); $chord.SimulateKey($r, $false); $chord.SimulateKey($alt, $false)
-    $chord.SimulateKey($alt, $true); $chord.SimulateKey($r, $true); $chord.SimulateKey($r, $false); $chord.SimulateKey($alt, $false)
-    Write-Output ('CHORDTEST case5 ocr=' + $script:ChordOcrHits + ' set=' + $script:ChordSetHits + ' ' + $(if ($script:ChordOcrHits -eq 2) { 'OK' } else { 'FAIL' }))
-
+    # 表驱动：keys = @(键码, 是否按下)，wantOcr/wantSet = 期望触发次数
+    $cases = @(
+        @{ name = '按住Alt -> R -> 松开Alt';          keys = @(@($alt, $true), @($r, $true), @($r, $false), @($alt, $false)); wantOcr = 1; wantSet = 0 },
+        @{ name = '按住Alt -> R -> S -> 松开';        keys = @(@($alt, $true), @($r, $true), @($s, $true), @($s, $false), @($r, $false), @($alt, $false)); wantOcr = 0; wantSet = 1 },
+        @{ name = '按住Alt -> R -> 其他键 -> 松开';   keys = @(@($alt, $true), @($r, $true), @($x, $true), @($x, $false), @($alt, $false)); wantOcr = 0; wantSet = 0 },
+        @{ name = '不按Alt 直接按 R / S';             keys = @(@($r, $true), @($r, $false), @($s, $true), @($s, $false)); wantOcr = 0; wantSet = 0 },
+        @{ name = '连续两次 Alt+R';                   keys = @(@($alt, $true), @($r, $true), @($r, $false), @($alt, $false), @($alt, $true), @($r, $true), @($r, $false), @($alt, $false)); wantOcr = 2; wantSet = 0 }
+    )
+    $fail = 0
+    $i = 0
+    foreach ($c in $cases) {
+        $i++
+        $script:ChordOcrHits = 0
+        $script:ChordSetHits = 0
+        foreach ($k in $c['keys']) { $chord.SimulateKey([int]$k[0], [bool]$k[1]) }
+        $ok = ($script:ChordOcrHits -eq $c['wantOcr'] -and $script:ChordSetHits -eq $c['wantSet'])
+        if (-not $ok) { $fail++ }
+        Write-Output ('CHORDTEST case' + $i + ' ' + $c['name'] + ' => ocr=' + $script:ChordOcrHits + ' set=' + $script:ChordSetHits + ' ' + $(if ($ok) { 'OK' } else { 'FAIL(期望 ocr=' + $c['wantOcr'] + ' set=' + $c['wantSet'] + ')' }))
+    }
+    Write-Output ('CHORDTEST result fail=' + $fail)
     Write-Output 'CHORDTEST-DONE'
 }
 
@@ -2071,16 +2421,17 @@ function Invoke-OcrSelfTest {
 
 # 接口自检：用当前配置真跑一次「测试图 -> 接口 -> 文字」
 function Invoke-ApiSelfTest {
-    $cfg = $script:Config
-    Write-Output ('APITEST engine=' + (Resolve-Engine))
-    Write-Output ('APITEST baseUrl=' + [string]$cfg['deepseek']['baseUrl'])
-    Write-Output ('APITEST model=' + [string]$cfg['deepseek']['model'])
-    Write-Output ('APITEST key=' + $(if ([string]::IsNullOrWhiteSpace([string]$cfg['deepseek']['apiKey'])) { '<empty>' } else { '<set,len=' + ([string]$cfg['deepseek']['apiKey']).Length + '>' }))
+    $eng = Resolve-Engine
+    $ctx = Get-RecognitionContext
+    Write-Output ('APITEST engine=' + (Get-EngineLabel -Engine $eng) + ' (' + [string]$ctx['providerId'] + '/' + [string]$ctx['shape'] + ')')
+    Write-Output ('APITEST baseUrl=' + [string]$ctx['baseUrl'])
+    Write-Output ('APITEST model=' + [string]$ctx['model'])
+    Write-Output ('APITEST key=' + $(if ([string]::IsNullOrWhiteSpace([string]$ctx['apiKey'])) { '<empty>' } else { '<set,len=' + ([string]$ctx['apiKey']).Length + '>' }))
     $img = New-TestImagePng
     # 故意走和 Alt+R 完全相同的后台任务链路（Start-Job + 定时器轮询 + 回调），
     # 这样这个自检就真的在验证生产路径，而不是另写一条捷径。
     $script:ApiTestResult = $null
-    $hard = [int]$cfg['deepseek']['timeoutSec'] + 30
+    $hard = [int]$script:Config['timeoutSec'] + 30
     $started = Start-ApiJob -ImagePath $img -TempFile $img -HardTimeoutSec $hard -OnDone {
         param($r)
         $script:ApiTestResult = $r
@@ -2114,18 +2465,23 @@ function Invoke-ApiSelfTest {
 
 function Show-CurrentConfig {
     $cfg = $script:Config
-    $key = [string]$cfg['deepseek']['apiKey']
+    $eng = Resolve-Engine
+    $ctx = Get-RecognitionContext
+    $key = [string]$ctx['apiKey']
     $masked = '<empty>'
     if (-not [string]::IsNullOrWhiteSpace($key)) {
         if ($key.Length -le 8) { $masked = '****' } else { $masked = $key.Substring(0, 4) + '****' + $key.Substring($key.Length - 4) }
     }
     Write-Output ('CONFIG path=' + (Get-ConfigPath))
     Write-Output ('CONFIG exists=' + (Test-Path -LiteralPath (Get-ConfigPath)))
-    Write-Output ('CONFIG engine=' + $cfg['engine'] + ' resolved=' + (Resolve-Engine))
-    Write-Output ('CONFIG baseUrl=' + $cfg['deepseek']['baseUrl'])
-    Write-Output ('CONFIG model=' + $cfg['deepseek']['model'])
-    Write-Output ('CONFIG detail=' + $cfg['deepseek']['detail'] + ' maxSide=' + $cfg['deepseek']['maxSide'] + ' timeout=' + $cfg['deepseek']['timeoutSec'])
+    Write-Output ('CONFIG version=' + [string]$cfg['version'])
+    Write-Output ('CONFIG engine=' + [string]$cfg['engine'] + ' -> ' + (Get-EngineLabel -Engine $eng) + ' active=' + [string]$eng['Active'] + $(if ($eng['Fallback']) { ' fallback=' + [string]$eng['Fallback'] } else { '' }))
+    Write-Output ('CONFIG provider=' + [string]$ctx['providerId'] + ' shape=' + [string]$ctx['shape'])
+    Write-Output ('CONFIG baseUrl=' + [string]$ctx['baseUrl'])
+    Write-Output ('CONFIG model=' + [string]$ctx['model'])
+    Write-Output ('CONFIG detail=' + [string]$ctx['detail'] + ' maxSide=' + [string]$ctx['maxSide'] + ' timeout=' + [string]$ctx['timeoutSec'])
     Write-Output ('CONFIG apiKey=' + $masked)
+    Write-Output ('CONFIG providers-configured=' + (@($cfg['providers'].Keys | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$cfg['providers'][$_]['apiKey']) }) -join ','))
     Write-Output 'CONFIG prompt>>>'
     Write-Output ([string]$cfg['prompt'])
     Write-Output 'CONFIG prompt<<<'
@@ -2144,7 +2500,7 @@ try {
     if ($CheckOcr) {
         $ok = Initialize-OcrEnvironment
         Write-Output ('ocr-engine=' + $(if ($ok) { 'available' } else { 'UNAVAILABLE' }))
-        Write-Output ('config-engine=' + (Resolve-Engine) + ' (' + $script:Config['engine'] + ')')
+        Write-Output ('config-engine=' + [string]$script:Config['engine'] + ' -> ' + (Get-EngineLabel))
         return
     }
     if ($ShowConfig) { Show-CurrentConfig; return }

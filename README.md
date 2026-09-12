@@ -3,14 +3,23 @@
 按 `Alt + R` → 框选屏幕上任意区域 → 识别 → 文字自动复制到剪贴板 → 托盘气泡提示。
 按 `Alt + R + S` → 打开设置窗口，切换识别引擎 / 填 API Key / 改提示词。
 
-## 两种识别引擎
+## 识别引擎
 
-| 引擎 | 说明 | 是否需要联网 |
+| 引擎 | 说明 | 是否联网 |
 | --- | --- | --- |
 | **本地**（默认） | Windows 10/11 内置 OCR（`Windows.Media.Ocr`）。离线、免费、不上传。 | 否 |
-| **DeepSeek** | 把截图发到 DeepSeek 多模态接口（OpenAI 兼容 `/chat/completions` + `image_url`），复杂排版、小字、表格更准。需要自己填 API Key。 | 是 |
+| **DeepSeek** | `deepseek-flash` 支持图片输入，复杂排版、小字、表格更准。**唯一实测过的远程服务。** | 是 |
+| OpenAI | 预设 `gpt-4o-mini` / `gpt-4o`（地址和模型名是预设值，未实测） | 是 |
+| 阿里云百炼 | 预设 `qwen-vl-max-latest`（未实测） | 是 |
+| 硅基流动 | 预设 `Qwen/Qwen2.5-VL-72B-Instruct`（未实测） | 是 |
+| Ollama | 本机模型，预设 `http://127.0.0.1:11434/v1`，不需要 Key（未实测） | 本机 |
+| 自定义 | 任意 OpenAI 兼容接口，自己填地址和模型名 | 看情况 |
 
-开箱即用是**本地**引擎，不需要任何配置；想换成接口识别，按 `Alt + R + S` 填 Key 即可。
+开箱即用是**本地**引擎，不需要任何配置；想换成接口识别，按 `Alt + R + S` 选服务、填 Key 即可。
+**每个服务的设置是分开存的**，来回切换不会互相覆盖。
+
+> 除 DeepSeek 外，其余预设只是省得你手抄地址，**没有逐一实测过**；不对就直接改「接口地址」那一栏。
+> 想加自己的服务？见下面「扩展：接入别的模型」。
 
 ## 使用
 
@@ -25,13 +34,17 @@
 
 窗口里可以改：
 
-- **识别引擎**：本地 / DeepSeek 二选一。
-- **接口地址**：默认 `https://api.deepseek.com`。任何 OpenAI 兼容的多模态接口都能填（会自动补 `/chat/completions`）。
-- **模型**：默认 `deepseek-flash`（DeepSeek 目前支持图片输入的模型）。
-- **API Key**：填进去点「保存并关闭」就**自动接入** —— 保存后程序会在后台拿一张测试图真跑一次识别，成功会弹托盘气泡「已接入 DeepSeek」，失败会弹出具体错误（Key 无效 / 网络不通 / 模型不支持图片）。
+- **识别引擎**：本地 / 接口（远程模型）二选一。
+- **识别服务**：选了「接口」后再挑具体服务（DeepSeek / OpenAI / 百炼 / 硅基流动 / Ollama / 自定义）。
+  切换服务时，界面上没保存的改动会先存进草稿，所以来回切不会丢。
+- **接口地址**：选服务时自动带出预设值，可以随便改。会自动补 `/chat/completions`。
+- **模型**：选服务时自动带出预设值。
+- **API Key**：填进去点「保存并关闭」就**自动接入** —— 保存后程序会在后台拿一张测试图真跑一次识别，成功会弹托盘气泡「已接入 xxx」，失败会弹出具体错误（Key 无效 / 网络不通 / 模型不支持图片）。
   - 在 Key 输入框里直接按回车 = 保存并接入。
   - 「显示」勾选后可以看到明文。
+  - Ollama / 自定义这种不需要 Key 的服务，Key 那一栏会自动灰掉。
 - **图片细节**：`original` / `high` / `low` / `auto`，传给接口的 `detail` 字段。
+  服务声明了不支持 `detail` 时（百炼/硅基流动/Ollama）这一栏会灰掉，请求里也不发这个字段。
 - **图片最长边**：上传前等比压缩到该像素数（默认 1920，填 0 = 不压缩）。
 - **超时**：单次请求超时秒数。
 - **上下文提示词**：写给模型的要求，**默认已经包含**下面这些约束，可以直接改：
@@ -56,7 +69,7 @@
 - 设置…（Alt+R+S）
 - 复制上次识别结果（剪贴板被占用时，用这个一键重试）
 - 打开配置文件所在文件夹
-- 识别引擎：本地 OCR / DeepSeek 接口（快速切换，不用开设置窗口）
+- 识别引擎 ▸ 本地 OCR / DeepSeek / OpenAI / …（子菜单直接点选，打勾的是当前引擎）
 - 退出
 
 ## 剪贴板写不进去怎么办
@@ -84,28 +97,68 @@ Windows 的剪贴板是**独占**的：任何程序在打开剪贴板的那一�
 
 ## 配置文件
 
-`%APPDATA%\ImgOcrAssistant\config.json`（可用环境变量 `IMGO_CFG` 指定别的路径）：
+`%APPDATA%\ImgOcrAssistant\config.json`（可用环境变量 `IMGO_CFG` 指定别的路径）。
+v2 结构：公共设置放顶层，**每个服务一份自己的设置**。
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "engine": "local",
   "prompt": "……（上下文提示词）……",
-  "deepseek": {
-    "apiKey": "",
-    "baseUrl": "https://api.deepseek.com",
-    "model": "deepseek-flash",
-    "detail": "original",
-    "maxSide": 1920,
-    "temperature": 0,
-    "timeoutSec": 60
+  "maxSide": 1920,
+  "temperature": 0,
+  "timeoutSec": 60,
+  "providers": {
+    "deepseek": { "apiKey": "", "baseUrl": "https://api.deepseek.com", "model": "deepseek-flash", "detail": "original" },
+    "openai":   { "apiKey": "", "baseUrl": "https://api.openai.com/v1", "model": "gpt-4o-mini", "detail": "original" },
+    "ollama":   { "apiKey": "", "baseUrl": "http://127.0.0.1:11434/v1", "model": "qwen2.5vl:7b", "detail": "original" }
   }
 }
 ```
 
+- **老版本（v1）配置会自动迁移**：原来 `deepseek` 那一段里的 Key/地址/模型会搬进 `providers.deepseek`，
+  `maxSide`/`temperature`/`timeoutSec` 会提到顶层。迁移后的文件会在下次保存时写成 v2。
 - API Key 是明文存在这个文件里的，**注意保密**，别把它连同文件一起发出去。
 - 程序运行中会监视这个文件，外部改动（比如手动编辑、或另开一个设置窗口保存）会被自动重新加载。
 - `-ShowConfig` 可以打印当前配置（Key 会打码）。
+
+## 扩展：接入别的模型
+
+代码里留了两个扩展点，都在 `ImgOcrAssistant.ps1` 里，加东西不用改其它逻辑。
+
+**1) 加一个服务** —— 在 `Get-ProviderCatalog` 的表里加一条：
+
+```powershell
+'myservice' = [ordered]@{
+    id = 'myservice'; kind = 'remote'; shape = 'openai-vision'
+    name = '我的服务'; desc = '一句话说明'
+    baseUrl = 'https://example.com/v1'; model = 'my-vl-model'
+    models = @('my-vl-model'); keyUrl = 'https://example.com/keys'
+    keyRequired = $true; supportsDetail = $false
+    note = '备注，会显示在设置窗口里'
+}
+```
+
+加完之后：设置窗口的「识别服务」下拉框、托盘「识别引擎」子菜单、配置文件的 `providers`
+都会自动多出这一项，不需要动别的地方。
+
+**2) 加一种请求格式** —— 如果那个服务不是 OpenAI 兼容的（Anthropic / Gemini 原生格式等），
+在 `$script:RequestShapes` 里加一个脚本块：
+
+```powershell
+'anthropic-vision' = {
+    param($ctx)          # baseUrl/model/apiKey/prompt/detail/temperature/userText/imageBase64
+    return @{
+        Path    = '/v1/messages'                  # 会拼在 baseUrl 后面
+        Body    = ($payload | ConvertTo-Json -Depth 12 -Compress)
+        Headers = @{ 'x-api-key' = [string]$ctx['apiKey']; 'anthropic-version' = '2023-06-01' }
+        Parser  = { param($json) return [string]$json.content[0].text }   # 怎么把响应变成文字
+    }
+}
+```
+
+然后把 provider 的 `shape` 指过去即可。**注意**：这个脚本块是自包含的，会被序列化后丢进
+后台 PowerShell 进程执行，所以里面不要调用本文件的其它函数。
 
 ## 开机自启
 
@@ -139,7 +192,9 @@ Windows 的剪贴板是**独占**的：任何程序在打开剪贴板的那一�
 - **接口识别时截图会上传**到你填的接口地址；用本地引擎则全程离线。
 - 接口调用跑在后台 PowerShell 任务里，不会卡住热键和托盘（也因此钩子不会被系统回收）。
 - 接口返回的正文是按 UTF-8 显式解码的（PowerShell 5.1 的 `Invoke-RestMethod` 在响应头不带 charset 时会把中文解成乱码，所以这里自己发了 `HttpWebRequest`）。
-- DeepSeek 接口要求图片只能出现在 user 消息里，程序就是这么拼的：`system` 放提示词，`user` 放「文字要求 + base64 图片」。
+- OpenAI 兼容格式要求图片出现在 user 消息里，程序就是这么拼的：`system` 放提示词，`user` 放「文字要求 + base64 图片」。
+- 换模型只影响「接口」这条路；本地引擎的行为跟版本无关。
+- 配置和识别结果的位置：`%APPDATA%\ImgOcrAssistant\` 下的 `config.json`（设置）、`imgocr.log`（出错记录）、`last-ocr.txt`（剪贴板写不进去时的兜底文本）。
 - 环境：Windows 10/11 + 系统自带 `powershell.exe`（Windows PowerShell 5.1）。
 - 中文识别需要系统已装中文 OCR 可选功能；用 `-CheckOcr` 查看是否可用。
 - 脚本文件必须保存为 **UTF-8 with BOM**，否则 Windows PowerShell 5.1 会按本地代码页解析导致中文乱码、语法报错。
