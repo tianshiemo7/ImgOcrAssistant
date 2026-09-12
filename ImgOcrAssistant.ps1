@@ -12,7 +12,8 @@
   依赖：Windows 10/11 + 系统自带 powershell.exe（Windows PowerShell 5.1）。
   配置：%APPDATA%\ImgOcrAssistant\config.json （可用环境变量 IMGO_CFG 改路径）
   参数：-CheckOcr / -SelfTest / -SmokeTest / -GuiSmoke / -OverlayTest
-        -Settings / -ShowConfig / -ApiSelfTest / -ChordTest / -ChordTestLive
+        -Settings / -ShowConfig / -ApiSelfTest / -ClipboardTest
+        -ChordTest / -ChordTestLive
         -InstallSelf / -UninstallSelf
 ============================================================================
 #>
@@ -28,6 +29,7 @@ param(
     [switch]$Settings,
     [switch]$ShowConfig,
     [switch]$ApiSelfTest,
+    [switch]$ClipboardTest,
     [switch]$ChordTest,
     [switch]$ChordTestLive
 )
@@ -54,6 +56,9 @@ $script:OcrEngine   = $null
 $script:Config      = $null
 $script:UiFont      = $null
 $script:UiScale     = 0
+$script:LastOcrText = $null
+$script:ClipPending = $null
+$script:ClipTimer   = $null
 $script:Dlg         = $null
 $script:DlgForm     = $null
 $script:DlgTesting  = $false
@@ -398,6 +403,112 @@ namespace ImgOcrNative
         public static int VkAlt { get { return VK_MENU; } }
         public static int VkR { get { return VK_R; } }
         public static int VkS { get { return VK_S; } }
+    }
+
+    /// <summary>
+    /// 直接操作 Win32 剪贴板（不走 OLE）。WinForms 的 Clipboard.SetText 在剪贴板被别的
+    /// 程序占用、或 OLE 出问题时只会抛 ExternalException，这里作为兜底再写一次。
+    /// </summary>
+    public static class Clip
+    {
+        private const uint CF_TEXT = 1;
+        private const uint CF_UNICODETEXT = 13;
+        private const uint GMEM_MOVEABLE = 0x0002;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool CloseClipboard();
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool EmptyClipboard();
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr GetClipboardData(uint uFormat);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GlobalLock(IntPtr hMem);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GlobalUnlock(IntPtr hMem);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GlobalFree(IntPtr hMem);
+
+        /// <summary>写入文本。成功返回 null，失败返回错误说明（已重试）。</summary>
+        public static string SetText(string text)
+        {
+            if (text == null) text = string.Empty;
+            int lastError = 0;
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                if (OpenClipboard(IntPtr.Zero))
+                {
+                    try
+                    {
+                        if (!EmptyClipboard())
+                        {
+                            lastError = Marshal.GetLastWin32Error();
+                            continue;
+                        }
+                        // 主格式：UTF-16
+                        byte[] uni = System.Text.Encoding.Unicode.GetBytes(text + "\0");
+                        if (!Put(CF_UNICODETEXT, uni))
+                        {
+                            lastError = Marshal.GetLastWin32Error();
+                            continue;
+                        }
+                        // 老程序只认 ANSI，再放一份（失败不影响结果）
+                        try
+                        {
+                            byte[] ansi = System.Text.Encoding.Default.GetBytes(text + "\0");
+                            Put(CF_TEXT, ansi);
+                        }
+                        catch { }
+                        return null;
+                    }
+                    finally { CloseClipboard(); }
+                }
+                lastError = Marshal.GetLastWin32Error();
+                System.Threading.Thread.Sleep(150);
+            }
+            return "OpenClipboard/SetClipboardData failed (Win32 error " + lastError + ")";
+        }
+
+        /// <summary>读取文本，失败返回 null。</summary>
+        public static string GetText()
+        {
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                if (OpenClipboard(IntPtr.Zero))
+                {
+                    try
+                    {
+                        IntPtr h = GetClipboardData(CF_UNICODETEXT);
+                        if (h == IntPtr.Zero) return null;
+                        IntPtr p = GlobalLock(h);
+                        if (p == IntPtr.Zero) return null;
+                        try { return Marshal.PtrToStringUni(p); }
+                        finally { GlobalUnlock(h); }
+                    }
+                    finally { CloseClipboard(); }
+                }
+                System.Threading.Thread.Sleep(150);
+            }
+            return null;
+        }
+
+        private static bool Put(uint format, byte[] bytes)
+        {
+            IntPtr h = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)bytes.Length);
+            if (h == IntPtr.Zero) return false;
+            IntPtr p = GlobalLock(h);
+            if (p == IntPtr.Zero) { GlobalFree(h); return false; }
+            Marshal.Copy(bytes, 0, p, bytes.Length);
+            GlobalUnlock(h);
+            if (SetClipboardData(format, h) == IntPtr.Zero) { GlobalFree(h); return false; }
+            // 成功时内存所有权已经交给剪贴板，不能自己释放
+            return true;
+        }
     }
 
     public static class ScreenCapture
@@ -956,19 +1067,122 @@ function Update-TrayText {
     try { $script:Notify.Text = $text } catch { }
 }
 
-function Publish-OcrText {
+# 出问题时留个痕迹，方便排查（和配置文件放一起）
+function Write-DiagLog {
+    param([string]$Message)
+    try {
+        $dir = Split-Path -Parent (Get-ConfigPath)
+        if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $Message + "`r`n"
+        [System.IO.File]::AppendAllText((Join-Path $dir 'imgocr.log'), $line, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+# 识别结果落盘：剪贴板写不进去时至少不丢字
+function Save-LastOcrText {
+    param([string]$Text)
+    try {
+        $dir = Split-Path -Parent (Get-ConfigPath)
+        if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $p = Join-Path $dir 'last-ocr.txt'
+        [System.IO.File]::WriteAllText($p, $Text, (New-Object System.Text.UTF8Encoding($true)))
+        return $p
+    } catch { return '' }
+}
+
+# 写剪贴板：先 WinForms（自带 OLE 重试），不行再退回原生 Win32 剪贴板
+# 写一次剪贴板。原生 Win32 通路为主：它不经过 OLE，失败会立刻返回（不阻塞消息循环），
+# 而且同时放 CF_UNICODETEXT + CF_TEXT 两份，兼容性够。OLE 那条留作最后的兜底。
+function Set-ClipboardText {
+    param([string]$Text, [int]$Attempts = 1, [int]$GapMs = 120, [switch]$SkipOle)
+    $errs = New-Object System.Collections.ArrayList
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            $e = [ImgOcrNative.Clip]::SetText($Text)
+            if ($null -eq $e) { return @{ Ok = $true; Via = 'Win32'; Error = '' } }
+            [void]$errs.Add('Win32#' + $i + ': ' + $e)
+        } catch { [void]$errs.Add('Win32#' + $i + ': ' + $_.Exception.Message) }
+        if ($i -lt $Attempts) { Start-Sleep -Milliseconds $GapMs }
+    }
+    if (-not $SkipOle) {
+        # WinForms 内部自带约 1 秒的 OLE 重试，所以只在主要通路失败后才用
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($Text)
+            return @{ Ok = $true; Via = 'WinForms'; Error = '' }
+        } catch { [void]$errs.Add('WinForms: ' + $_.Exception.Message) }
+    }
+    return @{ Ok = $false; Via = ''; Error = ($errs -join ' | ') }
+}
+
+# 投递识别结果：先同步快试一次，失败就交给定时器在消息循环里继续重试
+# （长时间 sleep 会把消息循环卡住，进而拖慢甚至被系统回收键盘钩子）
+function Start-ClipboardDelivery {
     param([string]$Text, [string]$Suffix = '')
     if ([string]::IsNullOrWhiteSpace($Text)) {
         Show-NotifyBalloon '未识别到文字' '所选区域没有可识别的文字，或文字太小 / 太模糊。' 'Warning'
         return $false
     }
-    $copied = $false
-    try { [System.Windows.Forms.Clipboard]::SetText($Text); $copied = $true } catch { }
+    $script:LastOcrText = $Text
     $sn = ($Text -replace '\s+', ' ').Trim()
     if ($sn.Length -gt 26) { $sn = $sn.Substring(0, 26) + '...' }
-    $title = $(if ($copied) { '已复制' } else { '识别完成（剪贴板写入失败）' })
-    Show-NotifyBalloon $title ('识别文字已复制到剪贴板' + $Suffix + '：' + $sn) $(if ($copied) { 'Info' } else { 'Warning' })
-    return $copied
+
+    # 第一步：原生快速重试几次（每次失败都是立刻返回，几乎不阻塞）
+    $r = Set-ClipboardText -Text $Text -Attempts 3 -GapMs 150 -SkipOle
+    if (-not $r['Ok']) {
+        # 第二步：走 OLE（自带重试），这一步最多阻塞约 1 秒
+        $r = Set-ClipboardText -Text $Text -Attempts 1
+    }
+    if ($r['Ok']) {
+        $script:ClipPending = $null
+        Show-NotifyBalloon '已复制' ('识别文字已复制到剪贴板' + $Suffix + '：' + $sn) 'Info'
+        return $true
+    }
+
+    Write-DiagLog ('剪贴板首次写入失败（引擎' + $Suffix + '，长度' + $Text.Length + '）：' + $r['Error'])
+    $script:ClipPending = @{ Text = $Text; Suffix = $Suffix; Sn = $sn; Tries = 0 }
+    if ($null -eq $script:ClipTimer) {
+        $script:ClipTimer = New-Object System.Windows.Forms.Timer
+        $script:ClipTimer.Interval = 400
+        $script:ClipTimer.add_Tick({ Step-ClipboardDelivery })
+    }
+    if (-not $script:ClipTimer.Enabled) { $script:ClipTimer.Start() }
+    Show-NotifyBalloon '正在重试复制' '剪贴板被别的程序（常见是微信/剪贴板工具）占用了一下，正在自动重试…' 'Info'
+    return $false
+}
+
+function Step-ClipboardDelivery {
+    $p = $script:ClipPending
+    if ($null -eq $p) { try { $script:ClipTimer.Stop() } catch { }; return }
+    $p['Tries'] = [int]$p['Tries'] + 1
+    $r = Set-ClipboardText -Text $p['Text'] -Attempts 1 -SkipOle
+
+    if ($r['Ok']) {
+        try { $script:ClipTimer.Stop() } catch { }
+        $script:ClipPending = $null
+        $suffix = $p['Suffix'] + '，重试 ' + $p['Tries'] + ' 次后成功'
+        Show-NotifyBalloon '已复制' ('识别文字已复制到剪贴板' + $suffix + '：' + $p['Sn']) 'Info'
+        Write-DiagLog ('剪贴板重试 ' + $p['Tries'] + ' 次后写入成功（' + $r['Via'] + '）')
+        return
+    }
+    if ($p['Tries'] -ge 25) {
+        try { $script:ClipTimer.Stop() } catch { }
+        $script:ClipPending = $null
+        Write-DiagLog ('剪贴板重试 ' + $p['Tries'] + ' 次仍失败：' + $r['Error'])
+        $path = Save-LastOcrText -Text $p['Text']
+        $tip = '文字识别出来了，但剪贴板一直被别的程序占用，写不进去。'
+        if (-not [string]::IsNullOrEmpty($path)) { $tip = $tip + '文字已保存到：' + $path + '（可直接打开复制）' }
+        $tip = $tip + ' 也可以关掉占用剪贴板的程序后，点托盘菜单「复制上次识别结果」。'
+        Show-NotifyBalloon '剪贴板写入失败' $tip 'Error'
+    }
+}
+
+function Publish-OcrText {
+    param([string]$Text, [string]$Suffix = '')
+    return (Start-ClipboardDelivery -Text $Text -Suffix $Suffix)
 }
 
 # 框选 -> 识别 -> 复制
@@ -1446,6 +1660,7 @@ function Set-AutoStart {
 # =====================================================================
 function Invoke-Exit {
     try { if ($null -ne $script:ApiTimer) { $script:ApiTimer.Stop() } } catch { }
+    try { if ($null -ne $script:ClipTimer) { $script:ClipTimer.Stop() } } catch { }
     try { if ($null -ne $script:CfgWatch) { $script:CfgWatch.Stop() } } catch { }
     try { if ($null -ne $script:ApiJob) { Remove-Job -Job $script:ApiJob['Job'] -Force -ErrorAction SilentlyContinue } } catch { }
     try { if ($null -ne $script:Chord) { $script:Chord.Uninstall() } } catch { }
@@ -1471,6 +1686,17 @@ function Build-TrayUi {
     $miSet = New-Object System.Windows.Forms.ToolStripMenuItem('设置…（Alt+R+S）')
     $miSet.add_Click({ Show-SettingsWindow })
     [void]$menu.Items.Add($miSet)
+
+    # 剪贴板被占用时，用这个一键重试（文字一直留在内存里）
+    $miRecopy = New-Object System.Windows.Forms.ToolStripMenuItem('复制上次识别结果')
+    $miRecopy.add_Click({
+        if ([string]::IsNullOrEmpty($script:LastOcrText)) {
+            Show-NotifyBalloon '还没有内容' '先用 Alt+R 识别一次文字。' 'Info'
+            return
+        }
+        [void](Start-ClipboardDelivery -Text $script:LastOcrText -Suffix '（上次结果）')
+    })
+    [void]$menu.Items.Add($miRecopy)
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
     $miOpenCfg = New-Object System.Windows.Forms.ToolStripMenuItem('打开配置文件所在文件夹')
@@ -1500,6 +1726,7 @@ function Build-TrayUi {
 
     $menu.add_Opening({
         $miMode.Text = '识别引擎：' + $(if ($script:Config['engine'] -eq 'deepseek') { 'DeepSeek 接口' } else { '本地 OCR' })
+        $miRecopy.Enabled = (-not [string]::IsNullOrEmpty($script:LastOcrText))
     })
     $script:Notify.ContextMenuStrip = $menu
 }
@@ -1596,6 +1823,94 @@ function Start-SettingsOnly {
 # =====================================================================
 #  冒烟 / 自检
 # =====================================================================
+# 剪贴板自检：分别验 WinForms 和原生 Win32 两条写入通路
+function Invoke-ClipboardTest {
+    Write-Output ('CLIPTEST sta=' + [System.Threading.Thread]::CurrentThread.GetApartmentState())
+    $stamp = 'IMGOCR-CLIP-' + (Get-Date).ToString('HHmmss')
+    $pass = 0; $fail = 0
+
+    # 1) 裸探针：只试一次，不带重试。失败不算问题 —— 说明别的程序（微信、剪贴板工具、
+    #    远程桌面等）恰好在这一瞬间占着剪贴板，这正是后面要重试的原因。
+    $wfRaw = ''
+    try { [System.Windows.Forms.Clipboard]::SetText($stamp + '-WF-RAW'); $wfRaw = 'OK' }
+    catch { $wfRaw = '被占用(' + $_.Exception.Message + ')' }
+    Write-Output ('CLIPTEST raw-winforms-single-try=' + $wfRaw + '   [仅参考，不判定成败]')
+
+    $ntRaw = ''
+    try {
+        $e = [ImgOcrNative.Clip]::SetText($stamp + '-NT-RAW')
+        $ntRaw = $(if ($null -eq $e) { 'OK' } else { '被占用(' + $e + ')' })
+    } catch { $ntRaw = '被占用(' + $_.Exception.Message + ')' }
+    Write-Output ('CLIPTEST raw-win32-single-try=' + $ntRaw + '    [仅参考，不判定成败]')
+
+    # 2) 实际使用的策略（带重试）—— 这几项才算成败
+    $ok = $false; $info = ''
+    try {
+        $r = Set-ClipboardText -Text ($stamp + '-STRATEGY') -Attempts 3
+        if ($r['Ok']) {
+            $back = [ImgOcrNative.Clip]::GetText()
+            $ok = ($back -eq $stamp + '-STRATEGY')
+            $info = 'via=' + $r['Via']
+            if ($ok) {
+                # 用 OLE/WinForms 再读一次，确认别的程序也能拿到
+                try {
+                    $viaOle = [System.Windows.Forms.Clipboard]::GetText()
+                    if ($viaOle -ne $stamp + '-STRATEGY') { $ok = $false; $info = 'OLE-readback=[' + $viaOle + ']' }
+                    else { $info = $info + '，Win32+OLE 都能读' }
+                } catch { $info = $info + '（OLE 读取失败：' + $_.Exception.Message + '）' }
+            } else { $info = $info + ' readback-mismatch' }
+        } else { $info = $r['Error'] }
+    } catch { $info = $_.Exception.Message }
+    if ($ok) { $pass++ } else { $fail++ }
+    Write-Output ('CLIPTEST strategy-retry=' + $(if ($ok) { 'OK ' + $info } else { 'FAIL ' + $info }))
+
+    # 3) 多行中文（OCR 的典型内容）
+    $cn = [string]::Join('', [char[]](0x7B2C, 0x4E8C, 0x884C, 0xFF1A, 0x4FDD, 0x7559, 0x6362, 0x884C))
+    $sample = "OCR TEST 12345`r`n$cn`r`nEnd line three"
+    $ok = $false; $info = ''
+    try {
+        $r = Set-ClipboardText -Text $sample -Attempts 3
+        if ($r['Ok']) {
+            $back = [ImgOcrNative.Clip]::GetText()
+            $ok = ($back -eq $sample)
+            $info = 'via=' + $r['Via']
+            if (-not $ok) { $info = $info + ' readback-mismatch' }
+        } else { $info = $r['Error'] }
+    } catch { $info = $_.Exception.Message }
+    if ($ok) { $pass++ } else { $fail++ }
+    Write-Output ('CLIPTEST multiline-cn=' + $(if ($ok) { 'OK ' + $info } else { 'FAIL ' + $info }))
+
+    # 4) 大文本（长截图可能一次几千行）
+    $big = ('IMGOCR-BIG-' + $stamp + "`r`n") * 2000
+    $ok = $false; $info = ''
+    try {
+        $r = Set-ClipboardText -Text $big -Attempts 3
+        if ($r['Ok']) {
+            $back = [ImgOcrNative.Clip]::GetText()
+            $ok = ($back -eq $big)
+            $info = ('len=' + $big.Length + ' via=' + $r['Via'])
+            if (-not $ok) { $info = $info + ' readback-mismatch(len=' + $(if ($null -eq $back) { 'null' } else { $back.Length }) + ')' }
+        } else { $info = $r['Error'] }
+    } catch { $info = $_.Exception.Message }
+    if ($ok) { $pass++ } else { $fail++ }
+    Write-Output ('CLIPTEST large-text=' + $(if ($ok) { 'OK ' + $info } else { 'FAIL ' + $info }))
+
+    # 5) 当前剪贴板里是什么（判断是不是被别的程序接管了）
+    $cur = [ImgOcrNative.Clip]::GetText()
+    if ($null -eq $cur) { Write-Output 'CLIPTEST current=<非文本或读不到>' }
+    else {
+        $show = $cur
+        if ($show.Length -gt 60) { $show = $show.Substring(0, 60) + '...' }
+        Write-Output ('CLIPTEST current=[' + ($show -replace "`r?`n", ' | ') + '] len=' + $cur.Length)
+    }
+
+    Write-Output ('CLIPTEST result pass=' + $pass + ' fail=' + $fail + $(if ($fail -eq 0) { '  => 写入没问题' } else { '  => 请看上面的错误' }))
+    if ($wfRaw -ne 'OK' -or $ntRaw -ne 'OK') {
+        Write-Output 'CLIPTEST note=裸探针失败说明有程序在抢剪贴板（微信/剪贴板工具最常见）；工具本身会重试，所以不影响使用。'
+    }
+    Write-Output 'CLIPTEST-DONE'
+}
+
 function Invoke-SmokeTest {
     Write-Output 'SMOKE-START'
     [void][ImgOcrNative.Dpi]::MakeAware()
@@ -1835,6 +2150,7 @@ try {
     if ($ShowConfig) { Show-CurrentConfig; return }
     if ($SelfTest) { Invoke-OcrSelfTest; return }
     if ($ApiSelfTest) { Invoke-ApiSelfTest; return }
+    if ($ClipboardTest) { Invoke-ClipboardTest; return }
     if ($ChordTest) { Invoke-ChordTest; return }
     if ($ChordTestLive) { Invoke-ChordTestLive; return }
     if ($OverlayTest) {
