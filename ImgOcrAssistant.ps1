@@ -60,6 +60,8 @@ $script:UiScale     = 0
 $script:ProviderCache   = $null
 $script:DlgDraft        = $null
 $script:DlgProviderIds  = @()
+$script:DlgLoading      = $false
+$script:DlgLoadedProvider = ''
 $script:LastOcrText = $null
 $script:ClipPending = $null
 $script:ClipTimer   = $null
@@ -313,6 +315,15 @@ function Export-Config {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     $json = $Config | ConvertTo-Json -Depth 8
+    # 配置写坏过一次（所有 provider 变成同一个），留个现场：谁写的、写进去的各 provider 模型是什么
+    try {
+        $shape = @()
+        foreach ($id in $Config['providers'].Keys) {
+            $shape += ($id + '=' + [string]$Config['providers'][$id]['model'] + '/' + $(if ([string]::IsNullOrWhiteSpace([string]$Config['providers'][$id]['apiKey'])) { '-' } else { 'K' }))
+        }
+        $stack = ((Get-PSCallStack) | Select-Object -Skip 1 -First 6 | ForEach-Object { $_.Command }) -join '<-'
+        Write-DiagLog ('保存配置 engine=' + [string]$Config['engine'] + ' [' + ($shape -join ' ') + '] 调用栈: ' + $stack)
+    } catch { }
     [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
     $script:CfgStamp = (Get-Item -LiteralPath $path).LastWriteTimeUtc
     return $path
@@ -882,6 +893,13 @@ function Initialize-OcrEnvironment {
     }
     try { $script:OcrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() } catch { $script:OcrEngine = $null }
     return ($null -ne $script:OcrEngine)
+}
+
+# 本地 OCR 环境是懒加载的：启动时用的是接口引擎、或者以后从接口切回本地、
+# 又或者接口没配 Key 回退到本地 —— 这些情况下都得在使用前补初始化一次。
+function Ensure-LocalOcr {
+    if ($null -ne $script:OcrEngine) { return $true }
+    return [bool](Initialize-OcrEnvironment)
 }
 
 function Wait-WinRtTask {
@@ -1476,6 +1494,11 @@ function Invoke-RegionOcr {
             return
         }
 
+        if (-not (Ensure-LocalOcr)) {
+            Show-NotifyBalloon '本地 OCR 不可用' '这台机器上没找到可用的 Windows OCR 语言包。可以按 Alt+R+S 改用接口引擎，或在「设置 → 时间和语言 → 语言和区域」里给中文补装「光学字符识别」组件。' 'Error'
+            return
+        }
+
         $text = ''
         try { $text = Invoke-OcrImage -Image $bmp } catch { Show-NotifyBalloon '本地识别出错' $_.Exception.Message 'Error'; return }
         [void](Start-ClipboardDelivery -Text $text -Suffix '（本地）')
@@ -1580,12 +1603,19 @@ function Get-DlgProviderId {
     return [string]$script:DlgProviderIds[$i]
 }
 
-# 把界面上当前 provider 的填写内容存回草稿
+# 把界面上这份填写内容存回草稿。
+# 关键：必须存回「这份数据本来属于哪个 provider」，而不是「下拉框现在选中的那个」——
+# 在 SelectedIndexChanged 里，索引此时已经变成新值了，用新值存就会把上一个服务的
+# Key/地址/模型整份拷进新选中的服务里（切几个就污染几个）。
 function Store-FormToDraft {
+    param([string]$ProviderId)
     $d = $script:Dlg
     if ($null -eq $d -or $null -eq $script:DlgDraft) { return }
-    $id = Get-DlgProviderId
+    $id = $ProviderId
+    if ([string]::IsNullOrWhiteSpace($id)) { $id = [string]$script:DlgLoadedProvider }
+    if ([string]::IsNullOrWhiteSpace($id) -or -not $script:DlgDraft['providers'].Contains($id)) { $id = Get-DlgProviderId }
     $ps = $script:DlgDraft['providers'][$id]
+    if ($null -eq $ps) { return }
     $ps['apiKey'] = ([string]$d['txtKey'].Text).Trim()
     $ps['baseUrl'] = ([string]$d['txtBase'].Text).Trim()
     $ps['model'] = ([string]$d['txtModel'].Text).Trim()
@@ -1616,6 +1646,8 @@ function Load-ProviderToForm {
     $hint = [string]$p['note']
     if ([string]::IsNullOrWhiteSpace($hint)) { $hint = [string]$p['desc'] }
     $d['lblProviderNote'].Text = $hint
+    # 记下「界面现在展示的是哪个服务」，Store-FormToDraft 靠它才知道该存回哪里
+    $script:DlgLoadedProvider = $Id
 }
 
 function Update-SettingsUi {
@@ -1834,8 +1866,10 @@ function Show-SettingsWindow {
     $rbLocal.add_CheckedChanged({ Update-SettingsUi })
     $rbApi.add_CheckedChanged({ Update-SettingsUi })
     $cboProvider.add_SelectedIndexChanged({
-        # 切服务前先把当前填写内容存回草稿，再把新服务的值刷上来
-        Store-FormToDraft
+        # 初始化期间不让它跑：那时界面还没装数据，存进去等于把值清空
+        if ($script:DlgLoading) { return }
+        # 先把界面这份存回「它原本属于的」provider，再加载新选中的
+        Store-FormToDraft -ProviderId $script:DlgLoadedProvider
         Load-ProviderToForm -Id (Get-DlgProviderId)
         Update-SettingsUi
     })
@@ -1903,7 +1937,10 @@ function Show-SettingsWindow {
     $script:Dlg = $d
     $script:DlgForm = $form
 
-    # 打开时定位到当前引擎：radio + 服务下拉框 + 该服务自己的设置
+    # 打开时定位到当前引擎：radio + 服务下拉框 + 该服务自己的设置。
+    # 这一段全程上锁（DlgLoading），避免 SelectedIndex 变化触发的事件把还没装载的
+    # 空界面当成用户输入存回草稿。
+    $script:DlgLoading = $true
     $engineId = [string]$cfg['engine']
     if ($engineId -eq 'local') {
         $rbLocal.Checked = $true
@@ -1913,8 +1950,10 @@ function Show-SettingsWindow {
         if ($idx -lt 0) { $idx = 0 }
         $cboProvider.SelectedIndex = $idx
     }
-    Load-ProviderToForm -Id (Get-DlgProviderId)
+    $script:DlgLoadedProvider = Get-DlgProviderId
+    Load-ProviderToForm -Id $script:DlgLoadedProvider
     Update-SettingsUi
+    $script:DlgLoading = $false
 
     try { $form.Show() } catch { }
     try { $form.Activate(); $form.BringToFront() } catch { }
@@ -2163,6 +2202,8 @@ function Set-ActiveEngine {
     Update-TrayText
     $tail = ''
     if ($eng['Fallback'] -eq 'missing-key') { $tail = '（还没填 API Key，会先用本地识别；按 Alt+R+S 填）' }
+    # 切到本地时顺手把 OCR 环境准备好，缺语言包就当场告诉用户，别等按 Alt+R 才发现
+    if ($eng['Active'] -eq 'local' -and -not (Ensure-LocalOcr)) { $tail = '（本地 OCR 不可用：系统里没有 OCR 语言包）' }
     Show-NotifyBalloon '已切换引擎' ('当前：' + (Get-EngineLabel -Engine $eng) + $tail) 'Info'
 }
 
@@ -2204,10 +2245,14 @@ function Start-Assistant {
     try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
     Install-ExceptionGuard
 
+    # 本地 OCR 环境启动就准备好（原来就是这样，第一次按 Alt+R 才不会卡一下）。
+    # 但只有当前引擎真的是本地时，初始化失败才需要提醒 —— 用接口引擎的话无所谓，
+    # 而且切到本地时 Invoke-RegionOcr 里还有 Ensure-LocalOcr 兜底。
+    $localOcrOk = $false
+    try { $localOcrOk = [bool](Initialize-OcrEnvironment) } catch { $localOcrOk = $false }
     $engine = Resolve-Engine
-    if ($engine['Active'] -eq 'local') {
-        $initOk = Initialize-OcrEnvironment
-        if (-not $initOk) { Write-Warning '本地 OCR 初始化失败（缺少识别语言），可改用接口引擎（Alt+R+S）。' }
+    if (-not $localOcrOk -and $engine['Active'] -eq 'local') {
+        Write-Warning '本地 OCR 初始化失败（缺少识别语言包），可改用接口引擎（Alt+R+S）。'
     }
 
     $script:Busy = $false
