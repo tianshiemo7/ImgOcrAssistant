@@ -837,6 +837,9 @@ function Update-ApiJob {
 function New-TestImagePng {
     $path = Join-Path ([System.IO.Path]::GetTempPath()) ('imgocr_probe_' + [guid]::NewGuid().ToString('N') + '.png')
     $bmp = New-Object System.Drawing.Bitmap(560, 140)
+    # 固定 96 DPI：进程 DPI-aware 时 Bitmap 会继承显示器 DPI（200% 屏上 34pt 文字会渲染到 788px 宽），
+    # 结果文字被裁掉，模型只能读到前几个字符。
+    try { $bmp.SetResolution(96, 96) } catch { }
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     try {
         $g.Clear([System.Drawing.Color]::White)
@@ -1057,7 +1060,7 @@ function Show-SettingsWindow {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '屏幕OCR助手 · 设置'
-    $form.ClientSize = New-Object System.Drawing.Size(624, 572)
+    $form.ClientSize = New-Object System.Drawing.Size(624, 600)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
     $form.MaximizeBox = $false
@@ -1199,9 +1202,10 @@ function Show-SettingsWindow {
     [void]$gbPrompt.Controls.Add((New-Label '默认要求：只输出文字、不用 Markdown、保留换行、不翻译不改写。' 146 152))
 
     # ---- 底部 ----
+    # 状态栏独占一整行，否则识别结果会被挤在按钮旁边截断
     $lblStatus = New-Object System.Windows.Forms.Label
-    $lblStatus.Location = New-Object System.Drawing.Point(16, 528)
-    $lblStatus.Size = New-Object System.Drawing.Size(280, 34)
+    $lblStatus.Location = New-Object System.Drawing.Point(16, 524)
+    $lblStatus.Size = New-Object System.Drawing.Size(596, 20)
     $lblStatus.AutoEllipsis = $true
     $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
     $d['lblStatus'] = $lblStatus
@@ -1209,21 +1213,21 @@ function Show-SettingsWindow {
 
     $btnTest = New-Object System.Windows.Forms.Button
     $btnTest.Text = '测试接口'
-    $btnTest.Location = New-Object System.Drawing.Point(302, 526)
+    $btnTest.Location = New-Object System.Drawing.Point(302, 552)
     $btnTest.Size = New-Object System.Drawing.Size(100, 32)
     $d['btnTest'] = $btnTest
     [void]$form.Controls.Add($btnTest)
 
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Text = '保存并关闭'
-    $btnSave.Location = New-Object System.Drawing.Point(408, 526)
+    $btnSave.Location = New-Object System.Drawing.Point(408, 552)
     $btnSave.Size = New-Object System.Drawing.Size(110, 32)
     $d['btnSave'] = $btnSave
     [void]$form.Controls.Add($btnSave)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = '取消'
-    $btnCancel.Location = New-Object System.Drawing.Point(524, 526)
+    $btnCancel.Location = New-Object System.Drawing.Point(524, 552)
     $btnCancel.Size = New-Object System.Drawing.Size(88, 32)
     $d['btnCancel'] = $btnCancel
     [void]$form.Controls.Add($btnCancel)
@@ -1268,7 +1272,7 @@ function Show-SettingsWindow {
             if ($null -ne $d2 -and -not $d2['Form'].IsDisposed) {
                 if ($null -ne $r -and $r['Ok']) {
                     $t = (([string]$r['Text']) -replace '\s+', ' ').Trim()
-                    if ($t.Length -gt 40) { $t = $t.Substring(0, 40) + '...' }
+                    if ($t.Length -gt 48) { $t = $t.Substring(0, 48) + '...' }
                     Set-SettingsStatus ('接口可用（' + [int]$r['ElapsedMs'] + ' ms）识别到：' + $t)
                 } else {
                     $msg = '接口调用失败'
@@ -1679,6 +1683,7 @@ function Invoke-OcrSelfTest {
     $bmp = $null; $g = $null
     try {
         $bmp = New-Object System.Drawing.Bitmap(900, 340)
+        try { $bmp.SetResolution(96, 96) } catch { }
         $g = [System.Drawing.Graphics]::FromImage($bmp)
         $g.Clear([System.Drawing.Color]::White)
         $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
