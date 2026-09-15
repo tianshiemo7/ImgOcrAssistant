@@ -23,10 +23,18 @@
 
 ## 使用
 
-1. 双击 `start-assistant.cmd` 启动（托盘出现放大镜图标）。
+1. 双击 **`start-assistant.vbs`** 启动（托盘出现放大镜图标）。**全程没有任何黑框。**
+   - `start-assistant.cmd` 也能用（命令行/脚本调用方便），但 `.cmd` 天生会带一个自己的控制台窗口，
+     双击时会闪一下；想要干净就用 `.vbs`。
 2. 按 **`Alt + R`**，鼠标框选屏幕区域（Esc 取消）。
 3. 松开鼠标即识别，文字进剪贴板，直接 Ctrl+V 粘贴。
    - 双击托盘图标 / 托盘右键 →「框选屏幕区域识别文字」效果相同。
+
+> **为什么是 .vbs 而不是 .cmd？**
+> Windows 11 把控制台交给 Windows Terminal 托管，`powershell.exe -WindowStyle Hidden` 在这种环境下
+> **隐藏不掉** —— 那个窗口会先冒出来、然后缩到任务栏里赖着不走（就是以前那个"黑框"）。
+> `wscript.exe` 自己没有控制台，再用 `WshShell.Run(..., 0, False)` 让 PowerShell 以 SW_HIDE 起步，
+> 就一个窗口都不会出现。开机自启也改用这个方式，所以登录时同样不会闪。
 
 ### 设置窗口：`Alt + R + S`
 
@@ -220,8 +228,9 @@ v2 结构：公共设置放顶层，**每个服务一份自己的设置**。
 
 ```
 ImgOcrAssistant.ps1      主程序（单文件）
-start-assistant.cmd      后台启动
-register-autostart.cmd   注册开机自启
+start-assistant.vbs      启动（无黑框，推荐双击这个）
+start-assistant.cmd      启动（命令行用；双击会闪一下它自己的控制台窗口）
+register-autostart.cmd   注册开机自启（用 wscript 方式，登录时不闪黑框）
 unregister-autostart.cmd 取消开机自启
 config.json              运行后生成在 %APPDATA%\ImgOcrAssistant\
 ```

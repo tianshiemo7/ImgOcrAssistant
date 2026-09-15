@@ -2037,7 +2037,17 @@ function Save-SettingsForm {
 # =====================================================================
 #  开机自启（HKCU Run，沿用原键名，两个 .cmd 仍然可用）
 # =====================================================================
+# 开机自启命令。优先用 start-assistant.vbs 走 wscript：wscript 本身没有控制台，
+# 子进程又用 SW_HIDE 起步，开机时一个黑框都不会闪。
+# （不要改成 `powershell.exe -WindowStyle Hidden`：Win11 的控制台由 Windows Terminal
+#   托管，那个参数会被它变成"窗口最小化留在任务栏上"。）
 function Get-AutoStartCommand {
+    $vbs = Join-Path (Split-Path -Parent $PSCommandPath) 'start-assistant.vbs'
+    $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    if ((Test-Path -LiteralPath $vbs) -and (Test-Path -LiteralPath $wscript)) {
+        return ('"' + $wscript + '" //B "' + $vbs + '"')
+    }
+    # 兜底：只有 .ps1 被单独拷贝出去时，仍用原来的写法
     $exe = Join-Path $PSHOME 'powershell.exe'
     return ('"' + $exe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File "' + $PSCommandPath + '"')
 }
